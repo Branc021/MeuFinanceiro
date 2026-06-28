@@ -2,13 +2,13 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import sqlite3
 import numpy as np
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import yfinance as yf
 import feedparser
-import io
+import psycopg2
+import warnings
 
 # =====================================================================
 # 1. UI/UX 3D, GLASSMORPHISM E FORMATAÇÃO MONETÁRIA
@@ -37,42 +37,55 @@ def m_fmt(valor):
     if pd.isna(valor): return "R$ 0,00"
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-DB_NAME = "financeiro_master.db"
 cartoes_banco = ["NUBANK", "PICPAY", "INTER", "MERCADO PAGO", "WILL", "BRADESCO", "RENNER", "OUTRO"]
+meses_pt = {
+    "janeiro": 1, "fevereiro": 2, "março": 3, "abril": 4, "maio": 5, "junho": 6,
+    "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12
+}
 
 # =====================================================================
-# 2. CAMADA DE DADOS E CONEXÕES
+# 2. CAMADA DE DADOS E CONEXÕES (SUPABASE POSTGRESQL)
 # =====================================================================
-def get_connection(): return sqlite3.connect(DB_NAME)
+def get_connection():
+    return psycopg2.connect(st.secrets["connections"]["postgresql"]["url"])
+
 def executar_query(query, params=()):
-    conn = get_connection(); cursor = conn.cursor(); cursor.execute(query, params); conn.commit(); conn.close()
+    conn = get_connection()
+    cursor = conn.cursor()
+    query = query.replace("?", "%s")
+    cursor.execute(query, params)
+    conn.commit()
+    conn.close()
+
 def get_df(query, params=()):
-    conn = get_connection(); df = pd.read_sql(query, conn, params=params); conn.close(); return df
+    conn = get_connection()
+    query = query.replace("?", "%s")
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', UserWarning)
+        df = pd.read_sql(query, conn, params=params)
+    conn.close()
+    return df
 
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
     
-    # Lista de tabelas e suas colunas
-    # Nota: Usei SERIAL para PostgreSQL. Se der erro de sintaxe, é porque o Supabase 
-    # prefere o tipo 'BIGSERIAL' ou a tabela já existe com outro ID.
+    tabelas = {
+        "transacoes": "id SERIAL PRIMARY KEY, tipo TEXT, descricao TEXT, categoria TEXT, valor REAL, data_competencia DATE, detalhes TEXT, status TEXT DEFAULT 'Pendente', centro_custo TEXT DEFAULT 'Pessoal', cartao_vinculado TEXT",
+        "compras_futuras": "id SERIAL PRIMARY KEY, item TEXT, valor REAL, prioridade TEXT, status TEXT DEFAULT 'Planejado', centro_custo TEXT, metodo TEXT DEFAULT 'PIX', parcelas INTEGER DEFAULT 1, cartao_vinculado TEXT",
+        "diario_apostas": "id SERIAL PRIMARY KEY, data DATE, esporte TEXT, mercado TEXT, odd REAL, stake REAL, resultado TEXT, lucro REAL",
+        "bancas_apostas": "id SERIAL PRIMARY KEY, casa TEXT, saldo REAL",
+        "investimentos": "id SERIAL PRIMARY KEY, ticker TEXT, tipo_ativo TEXT, quantidade REAL, preco_medio REAL, data_compra DATE"
+    }
     
-    tabelas = [
-        "transacoes (id SERIAL PRIMARY KEY, tipo TEXT, descricao TEXT, categoria TEXT, valor REAL, data_competencia DATE, detalhes TEXT, status TEXT DEFAULT 'Pendente', centro_custo TEXT DEFAULT 'Pessoal', cartao_vinculado TEXT)",
-        "compras_futuras (id SERIAL PRIMARY KEY, item TEXT, valor REAL, prioridade TEXT, status TEXT DEFAULT 'Planejado', centro_custo TEXT, metodo TEXT DEFAULT 'PIX', parcelas INTEGER DEFAULT 1, cartao_vinculado TEXT)",
-        "diario_apostas (id SERIAL PRIMARY KEY, data DATE, esporte TEXT, mercado TEXT, odd REAL, stake REAL, resultado TEXT, lucro REAL)",
-        "bancas_apostas (id SERIAL PRIMARY KEY, casa TEXT, saldo REAL)",
-        "investimentos (id SERIAL PRIMARY KEY, ticker TEXT, tipo_ativo TEXT, quantidade REAL, preco_medio REAL, data_compra DATE)"
-    ]
-    
-    for tabela in tabelas:
-        try:
-            cursor.execute(f"CREATE TABLE IF NOT EXISTS {tabela}")
-        except Exception as e:
-            print(f"Erro ao criar tabela: {e}")
-            
+    for nome, colunas in tabelas.items():
+        cursor.execute(f"CREATE TABLE IF NOT EXISTS {nome} ({colunas})")
+        
     conn.commit()
     conn.close()
+
+# Roda a inicialização para criar as tabelas no Supabase caso não existam
+init_db()
 
 # =====================================================================
 # 3. MOTORES DE CÁLCULO
@@ -341,7 +354,7 @@ with tabs[3]:
         with st.form("form_bet"):
             bc1, bc2, bc3 = st.columns(3)
             esporte = bc1.selectbox("Esporte", ["Futebol (Série A/Ligas)", "NBA", "Tênis", "NFL"])
-            mercado = bc2.text_input("Mercado Selecionado (Ex: Ambas Marcam)")
+            market = bc2.text_input("Mercado Selecionado (Ex: Ambas Marcam)")
             odd = bc3.number_input("Odd Fechada", min_value=1.01, value=1.80, format="%.2f")
             
             bc4, bc5 = st.columns(2)
@@ -350,7 +363,7 @@ with tabs[3]:
             if st.form_submit_button("Registrar Bilhete"):
                 lucro = (stake * odd) - stake if "Green" in resultado else -stake if "Red" in resultado else 0
                 if resultado == "Pendente": lucro = 0
-                executar_query("INSERT INTO diario_apostas (data, esporte, mercado, odd, stake, resultado, lucro) VALUES (?,?,?,?,?,?,?)", (hoje, esporte, mercado, odd, stake, resultado, lucro))
+                executar_query("INSERT INTO diario_apostas (data, esporte, mercado, odd, stake, resultado, lucro) VALUES (?,?,?,?,?,?,?)", (hoje, esporte, market, odd, stake, resultado, lucro))
                 st.rerun()
                 
         df_bets = get_df("SELECT * FROM diario_apostas ORDER BY id DESC")
@@ -440,7 +453,6 @@ with tabs[4]:
         if mes_detectado:
             num_mes = meses_pt[mes_detectado]
             if not df_trans.empty:
-                # CORREÇÃO CRÍTICA DO MOTOR DE SOMA DA IA
                 df_m = df_trans[(df_trans['data_competencia'].dt.month == num_mes) & (df_trans['data_competencia'].dt.year == hoje.year) & (df_trans['tipo'] == 'Despesa')]
                 st.info(f"📊 Relatório de {mes_detectado.capitalize()}/{hoje.year}:\n- O total de saídas no mês é **{m_fmt(df_m['valor'].sum())}**.\n- Deste montante, **{m_fmt(df_m[df_m['status'] == 'Pendente']['valor'].sum())}** constam como Pendentes.")
             else: st.warning("O banco de dados está vazio.")
@@ -480,7 +492,7 @@ with tabs[5]:
         st.subheader("Calculadora F.I.R.E (Regra de Retirada dos 4%)")
         renda_passiva = st.number_input("Salário mensal desejado para viver de rendimentos (R$)", value=10000.0)
         montante_magico = (renda_passiva * 12) / 0.04
-        st.success(f"🎯 **O Número Mágico:** Para sacar {m_fmt(renda_passiva)} todo mês sem reduzir seu patrimônio principal, acumule: **{m_fmt(montante_magico)}** investidos em ativos geradores de dividendos.")
+        st.success(f"🎯 **O Número Mágico:** Para sacar {m_fmt(renda_passiva)} todo mês sem reduzir seu patrimônio principal, acumule: **{m_fmt(montante_magico)}** investidos in ativos geradores de dividendos.")
 
     elif sim == "Financiamentos (Tabela Price)":
         st.subheader("Calculadora de Financiamento (Tabela Price)")
@@ -535,7 +547,6 @@ with tabs[7]:
     st.header("⚙️ Banco de Dados (Root Access)")
     df_tudo = get_df("SELECT * FROM transacoes ORDER BY data_competencia DESC")
     if not df_tudo.empty: 
-        # CORREÇÃO INTEGRAL: Seleciona apenas as colunas que efetivamente existem dinamicamente
         df_tudo['valor_formatado'] = df_tudo['valor'].apply(m_fmt)
         colunas_exibicao = [col for col in ['id', 'tipo', 'descricao', 'categoria', 'valor_formatado', 'data_competencia', 'status', 'cartao_vinculado'] if col in df_tudo.columns]
         st.dataframe(df_tudo[colunas_exibicao], use_container_width=True)
