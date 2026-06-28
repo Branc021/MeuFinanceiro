@@ -431,18 +431,38 @@ with tabs[4]:
     
     st.subheader("Radar de Passivos e Dívidas Futuras")
     meses_frente = st.slider("Mapear faturas acumuladas de quantos meses à frente?", 1, 12, 3)
+    
+    # 1. Cria uma lista forçada com a quantidade exata de meses do slider
+    lista_meses = [(hoje + relativedelta(months=i)).strftime('%m/%Y') for i in range(meses_frente)]
+    df_base = pd.DataFrame({'Mês Referência': lista_meses})
+    
     data_limite = hoje + relativedelta(months=meses_frente)
     
     if not df_trans.empty:
+        # Filtra as dívidas no período selecionado
         df_dividas = df_trans[(df_trans['tipo'] == 'Despesa') & (df_trans['status'] == 'Pendente') & (df_trans['data_competencia'] >= hoje) & (df_trans['data_competencia'] <= data_limite)].copy()
-        if not df_dividas.empty:
-            st.error(f"🚨 **Passivo de Médio Prazo:** {m_fmt(df_dividas['valor'].sum())} acumulados nos próximos {meses_frente} meses.")
-            df_dividas['Mês Referência'] = df_dividas['data_competencia'].dt.strftime('%m/%Y')
-            resumo_dividas = df_dividas.groupby('Mês Referência')['valor'].sum().reset_index().sort_values('Mês Referência')
-            resumo_dividas['Soma do Mês'] = resumo_dividas['valor'].apply(m_fmt)
-            st.table(resumo_dividas[['Mês Referência', 'Soma do Mês']])
+        
+        total_passivo = df_dividas['valor'].sum() if not df_dividas.empty else 0.0
+        
+        if total_passivo > 0:
+            st.error(f"🚨 **Passivo de Médio Prazo:** {m_fmt(total_passivo)} acumulados nos próximos {meses_frente} meses.")
         else:
-            st.success("✅ Nenhuma pendência futura mapeada para o período.")
+            st.success(f"✅ Nenhuma pendência futura mapeada para os próximos {meses_frente} meses.")
+
+        # Agrupa o que existe no banco
+        if not df_dividas.empty:
+            df_dividas['Mês Referência'] = df_dividas['data_competencia'].dt.strftime('%m/%Y')
+            resumo_dividas = df_dividas.groupby('Mês Referência')['valor'].sum().reset_index()
+        else:
+            resumo_dividas = pd.DataFrame(columns=['Mês Referência', 'valor'])
+
+        # 2. O Pulo do Gato: Mescla a lista forçada com os dados reais (preenche com 0 o que estiver vazio)
+        df_final = pd.merge(df_base, resumo_dividas, on='Mês Referência', how='left').fillna(0)
+        df_final['Soma do Mês'] = df_final['valor'].apply(m_fmt)
+        
+        st.table(df_final[['Mês Referência', 'Soma do Mês']])
+    else:
+        st.success("✅ Nenhuma pendência mapeada no banco de dados.")
             
     st.markdown("---")
     st.subheader("Consultar Registros")
