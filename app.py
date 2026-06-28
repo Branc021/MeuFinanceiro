@@ -53,24 +53,24 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
     
-    # Detecta se estamos usando PostgreSQL (Supabase) ou SQLite
-    is_postgres = "postgres" in str(type(conn))
+    # Lista de tabelas e suas colunas
+    # Nota: Usei SERIAL para PostgreSQL. Se der erro de sintaxe, é porque o Supabase 
+    # prefere o tipo 'BIGSERIAL' ou a tabela já existe com outro ID.
     
-    # Define o tipo de ID auto-incremental
-    id_type = "SERIAL PRIMARY KEY" if is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    tabelas = [
+        "transacoes (id SERIAL PRIMARY KEY, tipo TEXT, descricao TEXT, categoria TEXT, valor REAL, data_competencia DATE, detalhes TEXT, status TEXT DEFAULT 'Pendente', centro_custo TEXT DEFAULT 'Pessoal', cartao_vinculado TEXT)",
+        "compras_futuras (id SERIAL PRIMARY KEY, item TEXT, valor REAL, prioridade TEXT, status TEXT DEFAULT 'Planejado', centro_custo TEXT, metodo TEXT DEFAULT 'PIX', parcelas INTEGER DEFAULT 1, cartao_vinculado TEXT)",
+        "diario_apostas (id SERIAL PRIMARY KEY, data DATE, esporte TEXT, mercado TEXT, odd REAL, stake REAL, resultado TEXT, lucro REAL)",
+        "bancas_apostas (id SERIAL PRIMARY KEY, casa TEXT, saldo REAL)",
+        "investimentos (id SERIAL PRIMARY KEY, ticker TEXT, tipo_ativo TEXT, quantidade REAL, preco_medio REAL, data_compra DATE)"
+    ]
     
-    # Criação das Tabelas
-    tabelas = {
-        "transacoes": f"id {id_type}, tipo TEXT, descricao TEXT, categoria TEXT, valor REAL, data_competencia DATE, detalhes TEXT, status TEXT DEFAULT 'Pendente', centro_custo TEXT DEFAULT 'Pessoal', cartao_vinculado TEXT",
-        "compras_futuras": f"id {id_type}, item TEXT, valor REAL, prioridade TEXT, status TEXT DEFAULT 'Planejado', centro_custo TEXT, metodo TEXT DEFAULT 'PIX', parcelas INTEGER DEFAULT 1, cartao_vinculado TEXT",
-        "diario_apostas": f"id {id_type}, data DATE, esporte TEXT, mercado TEXT, odd REAL, stake REAL, resultado TEXT, lucro REAL",
-        "bancas_apostas": f"id {id_type}, casa TEXT, saldo REAL",
-        "investimentos": f"id {id_type}, ticker TEXT, tipo_ativo TEXT, quantidade REAL, preco_medio REAL, data_compra DATE"
-    }
-    
-    for nome, colunas in tabelas.items():
-        cursor.execute(f"CREATE TABLE IF NOT EXISTS {nome} ({colunas})")
-        
+    for tabela in tabelas:
+        try:
+            cursor.execute(f"CREATE TABLE IF NOT EXISTS {tabela}")
+        except Exception as e:
+            print(f"Erro ao criar tabela: {e}")
+            
     conn.commit()
     conn.close()
 
