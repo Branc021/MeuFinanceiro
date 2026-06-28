@@ -50,24 +50,29 @@ def get_df(query, params=()):
     conn = get_connection(); df = pd.read_sql(query, conn, params=params); conn.close(); return df
 
 def init_db():
-    conn = get_connection(); cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS transacoes (id INTEGER PRIMARY KEY AUTOINCREMENT, tipo TEXT, descricao TEXT, categoria TEXT, valor REAL, data_competencia DATE, detalhes TEXT, status TEXT DEFAULT 'Pendente', centro_custo TEXT DEFAULT 'Pessoal', cartao_vinculado TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS compras_futuras (id INTEGER PRIMARY KEY AUTOINCREMENT, item TEXT, valor REAL, prioridade TEXT, status TEXT DEFAULT 'Planejado', centro_custo TEXT, metodo TEXT, parcelas INTEGER, cartao_vinculado TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS diario_apostas (id INTEGER PRIMARY KEY AUTOINCREMENT, data DATE, esporte TEXT, mercado TEXT, odd REAL, stake REAL, resultado TEXT, lucro REAL)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS bancas_apostas (id INTEGER PRIMARY KEY AUTOINCREMENT, casa TEXT, saldo REAL)''')
+    conn = get_connection()
+    cursor = conn.cursor()
     
-    try: cursor.execute("ALTER TABLE transacoes ADD COLUMN cartao_vinculado TEXT")
-    except: pass
-    try: cursor.execute("ALTER TABLE compras_futuras ADD COLUMN metodo TEXT DEFAULT 'PIX'")
-    except: pass
-    try: cursor.execute("ALTER TABLE compras_futuras ADD COLUMN parcelas INTEGER DEFAULT 1")
-    except: pass
-    try: cursor.execute("ALTER TABLE compras_futuras ADD COLUMN cartao_vinculado TEXT")
-    except: pass
+    # Detecta se estamos usando PostgreSQL (Supabase) ou SQLite
+    is_postgres = "postgres" in str(type(conn))
     
-    conn.commit(); conn.close()
-
-init_db()
+    # Define o tipo de ID auto-incremental
+    id_type = "SERIAL PRIMARY KEY" if is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    
+    # Criação das Tabelas
+    tabelas = {
+        "transacoes": f"id {id_type}, tipo TEXT, descricao TEXT, categoria TEXT, valor REAL, data_competencia DATE, detalhes TEXT, status TEXT DEFAULT 'Pendente', centro_custo TEXT DEFAULT 'Pessoal', cartao_vinculado TEXT",
+        "compras_futuras": f"id {id_type}, item TEXT, valor REAL, prioridade TEXT, status TEXT DEFAULT 'Planejado', centro_custo TEXT, metodo TEXT DEFAULT 'PIX', parcelas INTEGER DEFAULT 1, cartao_vinculado TEXT",
+        "diario_apostas": f"id {id_type}, data DATE, esporte TEXT, mercado TEXT, odd REAL, stake REAL, resultado TEXT, lucro REAL",
+        "bancas_apostas": f"id {id_type}, casa TEXT, saldo REAL",
+        "investimentos": f"id {id_type}, ticker TEXT, tipo_ativo TEXT, quantidade REAL, preco_medio REAL, data_compra DATE"
+    }
+    
+    for nome, colunas in tabelas.items():
+        cursor.execute(f"CREATE TABLE IF NOT EXISTS {nome} ({colunas})")
+        
+    conn.commit()
+    conn.close()
 
 # =====================================================================
 # 3. MOTORES DE CÁLCULO
