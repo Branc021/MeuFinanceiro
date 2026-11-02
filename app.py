@@ -2,13 +2,19 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import sqlite3
 import numpy as np
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import yfinance as yf
 import feedparser
-import io
+import psycopg2
+from psycopg2.extras import execute_batch
+import sqlite3
+import tempfile
+import os
+import warnings
+
+warnings.filterwarnings('ignore', category=UserWarning, module='pandas')
 
 # =====================================================================
 # 1. UI/UX 3D, GLASSMORPHISM E FORMATAÇÃO MONETÁRIA
@@ -27,45 +33,66 @@ st.markdown(f"""
     .metric-card:hover {{ transform: translateY(-5px); box-shadow: 8px 12px 20px rgba(0,0,0,0.6); }}
     .ai-box {{ background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); padding: 20px; border-radius: 12px; border-left: 5px solid #4facf7; margin-top:10px; }}
     .ai-box-green {{ border-left: 5px solid #4caf50; background-color: #0f3460; padding: 20px; border-radius: 10px; margin-top:10px; }}
-    .bet-box {{ border-left: 5px solid #ff9800; background-color: #1a1a2e; padding: 20px; border-radius: 10px; margin-top:10px; }}
     h1, h2, h3 {{ color: #F3F4F6; }}
     </style>
 """, unsafe_allow_html=True)
 
 def m_fmt(valor):
-    """Formatador de Moeda para o padrão monetário real brasileiro brasileiro (R$ 1.000,00)"""
+    """Formatador de Moeda para o padrão monetário real brasileiro (R$ 1.000,00)"""
     if pd.isna(valor): return "R$ 0,00"
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-DB_NAME = "financeiro_master.db"
 cartoes_banco = ["NUBANK", "PICPAY", "INTER", "MERCADO PAGO", "WILL", "BRADESCO", "RENNER", "OUTRO"]
+meses_pt = {
+    "janeiro": 1, "fevereiro": 2, "março": 3, "abril": 4, "maio": 5, "junho": 6,
+    "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12
+}
+
+def detectar_cartao(descricao):
+    """Identifica automaticamente o cartão vinculado com base na descrição"""
+    if not descricao:
+        return None
+    desc_up = str(descricao).upper()
+    if "NUBANK" in desc_up: return "NUBANK"
+    if "PICPAY" in desc_up: return "PICPAY"
+    if "INTER" in desc_up: return "INTER"
+    if "MERCADO PAGO" in desc_up or "MARCADO PAGO" in desc_up: return "MERCADO PAGO"
+    if "WILL" in desc_up: return "WILL"
+    if "BRADESCO" in desc_up: return "BRADESCO"
+    if "RENNER" in desc_up: return "RENNER"
+    return None
 
 # =====================================================================
-# 2. CAMADA DE DADOS E CONEXÕES
+# 2. CAMADA DE DADOS E CONEXÕES (SUPABASE POSTGRESQL)
 # =====================================================================
-def get_connection(): return sqlite3.connect(DB_NAME)
+def get_connection():
+    return psycopg2.connect(st.secrets["connections"]["postgresql"]["url"])
+
 def executar_query(query, params=()):
-    conn = get_connection(); cursor = conn.cursor(); cursor.execute(query, params); conn.commit(); conn.close()
+    conn = get_connection()
+    cursor = conn.cursor()
+    query = query.replace("?", "%s")
+    cursor.execute(query, params)
+    conn.commit()
+    conn.close()
+
 def get_df(query, params=()):
-    conn = get_connection(); df = pd.read_sql(query, conn, params=params); conn.close(); return df
+    conn = get_connection()
+    query = query.replace("?", "%s")
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', UserWarning)
+        df = pd.read_sql(query, conn, params=params)
+    conn.close()
+    return df
 
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
     
-    # Detecta se estamos usando PostgreSQL (Supabase) ou SQLite
-    is_postgres = "postgres" in str(type(conn))
-    
-    # Define o tipo de ID auto-incremental
-    id_type = "SERIAL PRIMARY KEY" if is_postgres else "INTEGER PRIMARY KEY AUTOINCREMENT"
-    
-    # Criação das Tabelas
     tabelas = {
-        "transacoes": f"id {id_type}, tipo TEXT, descricao TEXT, categoria TEXT, valor REAL, data_competencia DATE, detalhes TEXT, status TEXT DEFAULT 'Pendente', centro_custo TEXT DEFAULT 'Pessoal', cartao_vinculado TEXT",
-        "compras_futuras": f"id {id_type}, item TEXT, valor REAL, prioridade TEXT, status TEXT DEFAULT 'Planejado', centro_custo TEXT, metodo TEXT DEFAULT 'PIX', parcelas INTEGER DEFAULT 1, cartao_vinculado TEXT",
-        "diario_apostas": f"id {id_type}, data DATE, esporte TEXT, mercado TEXT, odd REAL, stake REAL, resultado TEXT, lucro REAL",
-        "bancas_apostas": f"id {id_type}, casa TEXT, saldo REAL",
-        "investimentos": f"id {id_type}, ticker TEXT, tipo_ativo TEXT, quantidade REAL, preco_medio REAL, data_compra DATE"
+        "transacoes": "id SERIAL PRIMARY KEY, tipo TEXT, descricao TEXT, categoria TEXT, valor REAL, data_competencia DATE, detalhes TEXT, status TEXT DEFAULT 'Pendente', centro_custo TEXT DEFAULT 'Pessoal', cartao_vinculado TEXT",
+        "compras_futuras": "id SERIAL PRIMARY KEY, item TEXT, valor REAL, prioridade TEXT, status TEXT DEFAULT 'Planejado', centro_custo TEXT, metodo TEXT DEFAULT 'PIX', parcelas INTEGER DEFAULT 1, cartao_vinculado TEXT",
+        "investimentos": "id SERIAL PRIMARY KEY, ticker TEXT, tipo_ativo TEXT, quantidade REAL, preco_medio REAL, data_compra DATE"
     }
     
     for nome, colunas in tabelas.items():
@@ -73,6 +100,84 @@ def init_db():
         
     conn.commit()
     conn.close()
+
+def importar_arquivo_sqlite(caminho_sqlite, centro_custo_padrao="Pessoal"):
+    """Lê tanto o formato Despesas.db (expense/category) quanto financeiro_master.db (transacoes) e substitui no Supabase"""
+    conn_local = sqlite3.connect(caminho_sqlite)
+    cur_local = conn_local.cursor()
+    
+    cur_local.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tabelas_existentes = [r[0] for r in cur_local.fetchall()]
+    
+    registros_para_inserir = []
+    
+    if "expense" in tabelas_existentes:
+        # Formato original do app de Despesas (Despesas.db)
+        query_local = """
+            SELECT 
+                e.description,
+                 COALESCE(c.name, 'Outros') as categoria,
+                e.price,
+                e.dateTransaction,
+                e.status,
+                e.countPart
+            FROM expense e
+            LEFT JOIN category c ON e.categoryId = c.id
+        """
+        cur_local.execute(query_local)
+        linhas = cur_local.fetchall()
+        
+        for desc, cat, preco, data_tx, status_raw, count_part in linhas:
+            descricao_limpa = str(desc).strip()
+            categoria_limpa = str(cat).strip()
+            valor_float = float(preco) if preco is not None else 0.0
+            data_limpa = str(data_tx).strip()[:10]
+            status_final = "Pago" if str(status_raw).strip().upper() == "PAID" else "Pendente"
+            detalhes_txt = f"Importado | Parte {count_part}" if count_part else "Importado"
+            cartao_vinc = detectar_cartao(descricao_limpa)
+            
+            registros_para_inserir.append((
+                "Despesa", descricao_limpa, categoria_limpa, valor_float,
+                data_limpa, detalhes_txt, status_final, centro_custo_padrao, cartao_vinc
+            ))
+            
+    elif "transacoes" in tabelas_existentes:
+        # Formato já convertido (financeiro_master.db)
+        cur_local.execute("SELECT tipo, descricao, categoria, valor, data_competencia, detalhes, status, centro_custo, cartao_vinculado FROM transacoes")
+        linhas = cur_local.fetchall()
+        for t in linhas:
+            cartao_vinc = t[8] if t[8] and str(t[8]) != "None" else detectar_cartao(t[1])
+            registros_para_inserir.append((
+                t[0], str(t[1]).strip(), str(t[2]).strip(), float(t[3]),
+                str(t[4]).strip()[:10], t[5], t[6], t[7] or centro_custo_padrao, cartao_vinc
+            ))
+    else:
+        conn_local.close()
+        raise ValueError("O arquivo enviado não possui a tabela 'expense' nem 'transacoes'.")
+        
+    conn_local.close()
+    
+    # Conecta ao Supabase, limpa os dados antigos e insere os novos em lote
+    conn_nuvem = get_connection()
+    cur_nuvem = conn_nuvem.cursor()
+    try:
+        cur_nuvem.execute("TRUNCATE TABLE transacoes RESTART IDENTITY")
+        sql_insert = """
+            INSERT INTO transacoes 
+            (tipo, descricao, categoria, valor, data_competencia, detalhes, status, centro_custo, cartao_vinculado) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        execute_batch(cur_nuvem, sql_insert, registros_para_inserir, page_size=100)
+        conn_nuvem.commit()
+    except Exception as e:
+        conn_nuvem.rollback()
+        raise e
+    finally:
+        conn_nuvem.close()
+        
+    return len(registros_para_inserir)
+
+init_db()
 
 # =====================================================================
 # 3. MOTORES DE CÁLCULO
@@ -109,10 +214,10 @@ with st.sidebar:
     st.session_state.perfil_ativo = st.selectbox("Alternar Contexto:", ["Pessoal", "Elite Beach Performance"])
 
 # =====================================================================
-# 5. FILTRAGEM GLOBAL DE DADOS
+# 5. FILTRAGEM GLOBAL DE DADOS (SEM APOSTAS ESPORTIVAS)
 # =====================================================================
 st.title(f"⚡ Core Finance PRO | {st.session_state.perfil_ativo}")
-tabs = st.tabs(["📊 Dashboard", "💳 Operações & Cartões", "💼 Carteira", "⚽ Apostas Profissionais", "🤖 Consultor IA", "🔮 Simuladores", "💎 Radar 3D", "⚙️ Admin"])
+tabs = st.tabs(["📊 Dashboard", "💳 Operações & Cartões", "💼 Carteira", "🤖 Consultor IA", "🔮 Simuladores", "💎 Radar 3D", "⚙️ Admin"])
 
 df_trans = get_df("SELECT * FROM transacoes WHERE centro_custo = ?", (st.session_state.perfil_ativo,))
 if not df_trans.empty:
@@ -128,7 +233,7 @@ pendente_mes = df_mes[(df_mes['tipo'] == 'Despesa') & (df_mes['status'] == 'Pend
 saldo_livre = renda_exibicao - despesa_mes
 
 # =====================================================================
-# TAB 1: DASHBOARD
+# TAB 1 (tabs[0]): DASHBOARD
 # =====================================================================
 with tabs[0]:
     c1, c2, c3, c4 = st.columns(4)
@@ -172,7 +277,7 @@ with tabs[0]:
             st.plotly_chart(fig_pie, use_container_width=True)
 
 # =====================================================================
-# TAB 2: OPERAÇÕES, VENCIMENTOS E CARTÕES
+# TAB 2 (tabs[1]): OPERAÇÕES, VENCIMENTOS E CARTÕES
 # =====================================================================
 with tabs[1]:
     op_menu = st.radio("Selecione o Painel Operacional:", ["Registrar Transação", "Auditoria de Cartões", "🛒 Wishlist (Planejador)"], horizontal=True)
@@ -186,7 +291,7 @@ with tabs[1]:
             
             c4, c5, c6 = st.columns(3)
             descricao = c4.text_input("Descrição do Lançamento")
-            categoria = c5.selectbox("Categoria", ["Moradia", "Alimentação", "Transporte", "Dieta/Treino", "Lazer", "Investimento", "Banca de Apostas", "Cartão", "Outros"])
+            categoria = c5.selectbox("Categoria", ["Moradia", "Alimentação", "Transporte", "Dieta/Treino", "Educação", "Saúde", "Eletrônicos", "Entretenimento", "Lazer", "Investimento", "Cartão", "Outros"])
             parcelas = c6.number_input("Nº Parcelas", min_value=1, value=1)
             
             cartao_selecionado = st.selectbox("Se for crédito, selecione qual o cartão correspondente:", ["N/A"] + cartoes_banco)
@@ -275,7 +380,7 @@ with tabs[1]:
                         st.rerun()
 
 # =====================================================================
-# TAB 3: INVESTIMENTOS
+# TAB 3 (tabs[2]): INVESTIMENTOS
 # =====================================================================
 with tabs[2]:
     st.header("💼 Carteira e Custódia de Ativos", help="Espelho das suas ordens executadas na corretora de investimentos.")
@@ -312,124 +417,42 @@ with tabs[2]:
         st.dataframe(pd.DataFrame(dados_carteira), use_container_width=True)
 
 # =====================================================================
-# TAB 4: TRADER ESPORTIVO
+# TAB 4 (tabs[3]): INTELIGÊNCIA IA & SOMAS EXATAS
 # =====================================================================
 with tabs[3]:
-    st.header("⚽ Gestão de Banca e Apostas Profissionais")
-    bet_menu = st.radio("Selecione a Ferramenta Esportiva:", ["Diário de Apostas", "Calculadora EV+", "Critério de Kelly", "Alavancagem"], horizontal=True)
-    
-    if bet_menu == "Diário de Apostas":
-        st.subheader("🏦 Controle de Saldo por Casa de Apostas", help="Acompanhe o saldo real que você possui depositado em cada site.")
-        with st.form("banca_form"):
-            b1, b2 = st.columns(2)
-            nome_casa = b1.text_input("Casa de Apostas (Ex: Betfair, Betano)")
-            saldo_casa = b2.number_input("Saldo Disponível (R$)", min_value=0.0)
-            if st.form_submit_button("Salvar Saldo"):
-                executar_query("INSERT INTO bancas_apostas (casa, saldo) VALUES (?,?)", (nome_casa, saldo_casa))
-                st.rerun()
-        
-        df_bancas = get_df("SELECT * FROM bancas_apostas")
-        if not df_bancas.empty:
-            df_bancas['Saldo Formatado'] = df_bancas['saldo'].apply(m_fmt)
-            st.dataframe(df_bancas[['casa', 'Saldo Formatado']], use_container_width=True)
-            if st.button("Zerar Contas"):
-                executar_query("DELETE FROM bancas_apostas")
-                st.rerun()
-
-        st.markdown("---")
-        st.subheader("📝 Registrar Nova Entrada")
-        with st.form("form_bet"):
-            bc1, bc2, bc3 = st.columns(3)
-            esporte = bc1.selectbox("Esporte", ["Futebol (Série A/Ligas)", "NBA", "Tênis", "NFL"])
-            mercado = bc2.text_input("Mercado Selecionado (Ex: Ambas Marcam)")
-            odd = bc3.number_input("Odd Fechada", min_value=1.01, value=1.80, format="%.2f")
-            
-            bc4, bc5 = st.columns(2)
-            stake = bc4.number_input("Stake Utilizada (R$)", min_value=0.0, value=10.0)
-            resultado = bc5.selectbox("Resultado", ["Pendente", "Green ✅", "Red ❌", "Reembolso 🔄"])
-            if st.form_submit_button("Registrar Bilhete"):
-                lucro = (stake * odd) - stake if "Green" in resultado else -stake if "Red" in resultado else 0
-                if resultado == "Pendente": lucro = 0
-                executar_query("INSERT INTO diario_apostas (data, esporte, mercado, odd, stake, resultado, lucro) VALUES (?,?,?,?,?,?,?)", (hoje, esporte, mercado, odd, stake, resultado, lucro))
-                st.rerun()
-                
-        df_bets = get_df("SELECT * FROM diario_apostas ORDER BY id DESC")
-        if not df_bets.empty:
-            df_resolvidos = df_bets[df_bets['resultado'] != "Pendente"]
-            lucro_total = df_resolvidos['lucro'].sum()
-            roi = (lucro_total / df_resolvidos['stake'].sum() * 100) if df_resolvidos['stake'].sum() > 0 else 0
-            st.metric("P&L Acumulado (Lucro/Prejuízo)", m_fmt(lucro_total), f"ROI Geral: {roi:.2f}%")
-            
-            st.write("**Atualizar Status de Bilhete:**")
-            edit_id = st.selectbox("ID do Bilhete Pendente:", df_bets[df_bets['resultado'] == 'Pendente']['id'].tolist() if not df_bets[df_bets['resultado'] == 'Pendente'].empty else ["Nenhum pendente"])
-            if edit_id != "Nenhum pendente":
-                edit_status = st.selectbox("Alterar Status:", ["Green ✅", "Red ❌", "Reembolso 🔄"])
-                if st.button("Liquidar Bilhete"):
-                    row_bet = df_bets[df_bets['id'] == edit_id].iloc[0]
-                    n_lucro = (row_bet['stake'] * row_bet['odd']) - row_bet['stake'] if "Green" in edit_status else -row_bet['stake'] if "Red" in edit_status else 0
-                    executar_query("UPDATE diario_apostas SET resultado = ?, lucro = ? WHERE id = ?", (edit_status, n_lucro, edit_id))
-                    st.rerun()
-                    
-            df_display = df_bets.copy()
-            df_display['stake'] = df_display['stake'].apply(m_fmt)
-            df_display['lucro'] = df_display['lucro'].apply(m_fmt)
-            st.dataframe(df_display, use_container_width=True)
-
-    elif bet_menu == "Calculadora EV+":
-        st.subheader("Expected Value (+EV) — Valor Esperado Positivo", help="O EV+ calcula se a precificação da casa de apostas te dá lucro estatístico a longo prazo.")
-        odd_casa = st.number_input("Odd Oferecida pela Casa de Apostas", value=2.10, step=0.01)
-        prob_real = st.slider("Qual a sua Probabilidade Estatística de Acerto? (%)", 1, 100, 55)
-        
-        ev = ((prob_real / 100) * odd_casa) - 1
-        if ev > 0:
-            st.success(f"✅ **APOSTA DE VALOR (+EV) DETECTADA!**\n\nVantagem matemática real de **{(ev*100):.2f}%** sobre a casa de apostas.")
-        else:
-            st.error(f"❌ **APOSTA SEM VALOR VALOR (-EV)**\n\nDesvantagem estatística de **{(ev*100):.2f}%**. Aborte a operação.")
-
-    elif bet_menu == "Critério de Kelly":
-        st.subheader("Equação de Kelly (Gerenciamento de Risco)", help="Mecanismo matemático que dita o tamanho exato da sua aposta com base na sua banca para evitar quebras por sequências de perdas.")
-        ck1, ck2, ck3 = st.columns(3)
-        banca_total = ck1.number_input("Banca Consolidada (R$)", value=1000.0)
-        odd_kelly = ck2.number_input("Odd da Linha", value=1.90)
-        prob_kelly = ck3.slider("Sua Probabilidade Real de Acerto (%)", 1, 100, 60)
-        
-        b = odd_kelly - 1; p = prob_kelly / 100; q = 1 - p
-        f_star = ((b * p) - q) / b
-        if f_star > 0: 
-            st.markdown(f"<div class='bet-box'>🛡️ **Stake Exata Recomendada:** **{m_fmt(banca_total * f_star)}** ({f_star*100:.1f}% do caixa).</div>", unsafe_allow_html=True)
-        else: 
-            st.error("Risco acentuado. Stake recomendada: R$ 0,00.")
-        
-    elif bet_menu == "Alavancagem":
-        st.subheader("Projeto de Alavancagem Exponencial")
-        cs1, cs2, cs3 = st.columns(3)
-        banca_inicial = cs1.number_input("Banca Inicial Operada (R$)", value=100.0)
-        odd_media_diaria = cs2.number_input("Odd Alvo Diária", value=1.25, step=0.01)
-        dias_acerto = cs3.slider("Ciclos Consecutivos em Green", 1, 60, 15)
-        
-        banca_final = banca_inicial * (odd_media_diaria ** dias_acerto)
-        st.success(f"🚀 **Potencial da Alavancagem Coberta:** {m_fmt(banca_inicial)} transformam-se em **{m_fmt(banca_final)}** após {dias_acerto} dias.")
-
-# =====================================================================
-# TAB 5: INTELIGÊNCIA IA & SOMAS EXATAS
-# =====================================================================
-with tabs[4]:
     st.header("🤖 Consultor de IA e Mapa de Dívidas", help="Audita faturas futuras e parcelamentos agregados.")
     
     st.subheader("Radar de Passivos e Dívidas Futuras")
     meses_frente = st.slider("Mapear faturas acumuladas de quantos meses à frente?", 1, 12, 3)
+    
+    lista_meses = [(hoje + relativedelta(months=i)).strftime('%m/%Y') for i in range(meses_frente)]
+    df_base = pd.DataFrame({'Mês Referência': lista_meses})
+    
+    inicio_mes_atual = datetime(hoje.year, hoje.month, 1)
     data_limite = hoje + relativedelta(months=meses_frente)
     
     if not df_trans.empty:
-        df_dividas = df_trans[(df_trans['tipo'] == 'Despesa') & (df_trans['status'] == 'Pendente') & (df_trans['data_competencia'] >= hoje) & (df_trans['data_competencia'] <= data_limite)].copy()
-        if not df_dividas.empty:
-            st.error(f"🚨 **Passivo de Médio Prazo:** {m_fmt(df_dividas['valor'].sum())} acumulados nos próximos {meses_frente} meses.")
-            df_dividas['Mês Referência'] = df_dividas['data_competencia'].dt.strftime('%m/%Y')
-            resumo_dividas = df_dividas.groupby('Mês Referência')['valor'].sum().reset_index().sort_values('Mês Referência')
-            resumo_dividas['Soma do Mês'] = resumo_dividas['valor'].apply(m_fmt)
-            st.table(resumo_dividas[['Mês Referência', 'Soma do Mês']])
+        df_dividas = df_trans[(df_trans['tipo'] == 'Despesa') & (df_trans['status'] == 'Pendente') & (df_trans['data_competencia'] >= inicio_mes_atual) & (df_trans['data_competencia'] <= data_limite)].copy()
+        
+        total_passivo = df_dividas['valor'].sum() if not df_dividas.empty else 0.0
+        
+        if total_passivo > 0:
+            st.error(f"🚨 **Passivo de Médio Prazo:** {m_fmt(total_passivo)} acumulados nos próximos {meses_frente} meses.")
         else:
-            st.success("✅ Nenhuma pendência futura mapeada para o período.")
+            st.success(f"✅ Nenhuma pendência futura mapeada para os próximos {meses_frente} meses.")
+
+        if not df_dividas.empty:
+            df_dividas['Mês Referência'] = df_dividas['data_competencia'].dt.strftime('%m/%Y')
+            resumo_dividas = df_dividas.groupby('Mês Referência')['valor'].sum().reset_index()
+        else:
+            resumo_dividas = pd.DataFrame(columns=['Mês Referência', 'valor'])
+
+        df_final = pd.merge(df_base, resumo_dividas, on='Mês Referência', how='left').fillna(0)
+        df_final['Soma do Mês'] = df_final['valor'].apply(m_fmt)
+        
+        st.table(df_final[['Mês Referência', 'Soma do Mês']])
+    else:
+        st.success("✅ Nenhuma pendência mapeada no banco de dados.")
             
     st.markdown("---")
     st.subheader("Consultar Registros")
@@ -440,16 +463,15 @@ with tabs[4]:
         if mes_detectado:
             num_mes = meses_pt[mes_detectado]
             if not df_trans.empty:
-                # CORREÇÃO CRÍTICA DO MOTOR DE SOMA DA IA
                 df_m = df_trans[(df_trans['data_competencia'].dt.month == num_mes) & (df_trans['data_competencia'].dt.year == hoje.year) & (df_trans['tipo'] == 'Despesa')]
                 st.info(f"📊 Relatório de {mes_detectado.capitalize()}/{hoje.year}:\n- O total de saídas no mês é **{m_fmt(df_m['valor'].sum())}**.\n- Deste montante, **{m_fmt(df_m[df_m['status'] == 'Pendente']['valor'].sum())}** constam como Pendentes.")
             else: st.warning("O banco de dados está vazio.")
         elif "resumo" in p: st.info(f"O seu Saldo Livre atual é de **{m_fmt(saldo_livre)}**.")
 
 # =====================================================================
-# TAB 6: ORÇAMENTO COMPLETO, F.I.R.E. E PRICE
+# TAB 5 (tabs[4]): ORÇAMENTO COMPLETO, F.I.R.E. E PRICE
 # =====================================================================
-with tabs[5]:
+with tabs[4]:
     st.header("🔮 Simuladores: Arquitetura de Vida e Orçamento")
     sim = st.selectbox("Escolha a Ferramenta de Planejamento:", ["Orçamento Inteligente Base-Zero", "Independência Financeira (F.I.R.E)", "Financiamentos (Tabela Price)"])
 
@@ -492,9 +514,9 @@ with tabs[5]:
             st.error(f"**Custo Real:** A sua parcela fixa será de **{m_fmt(p)}**. No final do período, terá desembolsado **{m_fmt(p*m)}**. Apenas de juros comerciais para o banco, você pagará **{m_fmt((p*m)-v)}**.")
 
 # =====================================================================
-# TAB 7: VISÃO 3D E MERCADO
+# TAB 6 (tabs[5]): VISÃO 3D E MERCADO
 # =====================================================================
-with tabs[6]:
+with tabs[5]:
     st.header("💎 Visão Global de Mercado", help="Monitoração de indicadores econômicos e evolução patrimonial em 3D.")
     
     st.subheader("Superfície 3D: A Montanha dos Juros Compostos", help="Gire este gráfico livremente! Ele evidencia que o Tempo (X) aliado aos Juros (Y) cria uma curvatura explosiva de enriquecimento (Z).")
@@ -529,19 +551,42 @@ with tabs[6]:
             st.metric(nome, f"{val:,.2f}")
 
 # =====================================================================
-# TAB 8: ADMIN (CORREÇÃO DE ÍNDICE CRÍTICO)
+# TAB 7 (tabs[6]): ADMIN & IMPORTADOR DE ARQUIVO .DB
 # =====================================================================
-with tabs[7]:
-    st.header("⚙️ Banco de Dados (Root Access)")
+with tabs[6]:
+    st.header("⚙️ Banco de Dados & Sincronização (Root Access)")
+    
+    st.subheader("🔄 Importar Arquivo `Despesas.db` e Substituir Dados")
+    st.write("Envie o seu arquivo `.db` atualizado abaixo. O sistema converterá automaticamente as tabelas `expense` e `category` (ou `transacoes`), limpará os registros antigos e atualizará toda a nuvem.")
+    
+    arquivo_db = st.file_uploader("Selecione o arquivo Despesas.db ou financeiro_master.db", type=["db", "sqlite", "sqlite3"])
+    
+    if arquivo_db is not None:
+        if st.button("🚀 Substituir Todos os Valores do Banco de Dados", type="primary"):
+            with st.spinner("Sincronizando e substituindo registros no Supabase..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+                    tmp.write(arquivo_db.read())
+                    caminho_tmp = tmp.name
+                try:
+                    total_importado = importar_arquivo_sqlite(caminho_tmp, st.session_state.perfil_ativo)
+                    st.success(f"✅ Sucesso absoluto! {total_importado} registros foram importados e substituídos no banco de dados.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Erro ao importar o arquivo: {e}")
+                finally:
+                    if os.path.exists(caminho_tmp):
+                        os.remove(caminho_tmp)
+                        
+    st.markdown("---")
+    st.subheader("📋 Registros Atuais no Banco de Dados")
     df_tudo = get_df("SELECT * FROM transacoes ORDER BY data_competencia DESC")
     if not df_tudo.empty: 
-        # CORREÇÃO INTEGRAL: Seleciona apenas as colunas que efetivamente existem dinamicamente
         df_tudo['valor_formatado'] = df_tudo['valor'].apply(m_fmt)
         colunas_exibicao = [col for col in ['id', 'tipo', 'descricao', 'categoria', 'valor_formatado', 'data_competencia', 'status', 'cartao_vinculado'] if col in df_tudo.columns]
         st.dataframe(df_tudo[colunas_exibicao], use_container_width=True)
         
         if st.button("Limpar Banco Consolidado 🗑️", help="Exclui todas as transações permanentemente de forma irreversível."):
-            executar_query("DELETE FROM transacoes")
+            executar_query("TRUNCATE TABLE transacoes RESTART IDENTITY")
             st.rerun()
     else: 
-        st.warning("O banco de dados está vazio. Registre transações para visualizar o Grid.")
+        st.warning("O banco de dados está vazio. Importe um arquivo .db acima ou registre transações.")
