@@ -1370,7 +1370,9 @@ with tabs[7]:
     if IS_ADMIN:
         with st.expander("👑 PAINEL MASTER DO ADMINISTRADOR (Gestão de Clientes, Planos e Unificação)", expanded=True):
             st.caption("Controle exclusivo da sua conta Admin: gerencie planos de usuários (FREE / PRO / DONO), redefina senhas ou unifique dados.")
-            df_todos_users = get_df("SELECT id, nome, email, plano, renda_mensal, criado_em FROM usuarios ORDER BY id")
+            df_raw_users = get_df("SELECT * FROM usuarios ORDER BY id")
+            cols_u = [c for c in ['id', 'nome', 'email', 'plano', 'role', 'renda_mensal'] if c in df_raw_users.columns]
+            df_todos_users = df_raw_users[cols_u]
             st.dataframe(df_todos_users, use_container_width=True)
             
             adm_c1, adm_c2, adm_c3, adm_c4 = st.columns(4)
