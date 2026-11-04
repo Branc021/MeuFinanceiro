@@ -1368,43 +1368,68 @@ with tabs[7]:
     
     # --- PAINEL EXCLUSIVO DO ADMINISTRADOR (DONO DO SISTEMA) ---
     if IS_ADMIN:
-        with st.expander("👑 PAINEL MASTER DO ADMINISTRADOR (Gestão de Clientes, Planos e Unificação)", expanded=True):
-            st.caption("Controle exclusivo da sua conta Admin: gerencie planos de usuários (FREE / PRO / DONO), redefina senhas ou unifique dados.")
+        with st.expander("👑 PAINEL MASTER DO ADMINISTRADOR (Gestão de Clientes, Planos e Exclusão)", expanded=True):
+            st.caption("Controle exclusivo da sua conta Admin: gerencie planos (FREE / PRO / DONO), redefina senhas, unifique dados ou exclua contas.")
             df_raw_users = get_df("SELECT * FROM usuarios ORDER BY id")
             cols_u = [c for c in ['id', 'nome', 'email', 'plano', 'role', 'renda_mensal'] if c in df_raw_users.columns]
             df_todos_users = df_raw_users[cols_u]
-            st.dataframe(df_todos_users, use_container_width=True)
+            st.dataframe(df_todos_users, use_container_width=True, hide_index=True)
             
             adm_c1, adm_c2, adm_c3, adm_c4 = st.columns(4)
             u_alvo = adm_c1.selectbox("Selecionar ID de Usuário:", df_todos_users['id'].tolist())
             novo_plano_u = adm_c2.selectbox("Alterar Plano para:", ["free", "pro", "dono"])
-            if adm_c3.button("💾 Salvar Plano do Usuário", type="primary"):
+            
+            if adm_c3.button("💾 Salvar Plano", type="primary", use_container_width=True):
                 role_novo = "admin" if novo_plano_u == "dono" else "user"
                 executar_query("UPDATE usuarios SET plano = ?, role = ? WHERE id = ?", (novo_plano_u, role_novo, int(u_alvo)))
                 if int(u_alvo) == USER_ID:
                     st.session_state.usuario_logado["plano"] = novo_plano_u
-                st.success(f"✅ Usuário ID {u_alvo} atualizado para o plano {novo_plano_u.upper()}!")
+                st.success(f"✅ Usuário ID {u_alvo} atualizado para {novo_plano_u.upper()}!")
                 st.rerun()
-            if adm_c4.button("🔄 Puxar Dados da Conta Secundária p/ Admin"):
-                df_sec_u = get_df("SELECT id FROM usuarios WHERE LOWER(email) = 'terstegenelionelmessi@gmail.com'")
-                if not df_sec_u.empty:
-                    id_s = int(df_sec_u.iloc[0]['id'])
-                    executar_query("UPDATE transacoes SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, id_s))
-                    executar_query("UPDATE compras_futuras SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, id_s))
-                    executar_query("UPDATE investimentos SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, id_s))
-                    executar_query("UPDATE poupanca_metas SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, id_s))
-                    st.success("✅ Todos os registros foram unificados na sua conta Admin!")
+                
+            if adm_c4.button("🔄 Puxar Dados p/ Admin", use_container_width=True, help="Transfere os lançamentos do usuário selecionado para a sua conta Admin"):
+                if int(u_alvo) != USER_ID:
+                    executar_query("UPDATE transacoes SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, int(u_alvo)))
+                    executar_query("UPDATE compras_futuras SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, int(u_alvo)))
+                    executar_query("UPDATE investimentos SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, int(u_alvo)))
+                    executar_query("UPDATE poupanca_metas SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, int(u_alvo)))
+                    st.success(f"✅ Todos os registros do usuário ID {u_alvo} foram transferidos para sua conta Admin!")
                     st.rerun()
-
-            st.markdown("##### 🔐 Redefinir Senha de Qualquer Usuário (Sem precisar de script externo)")
-            rs1, rs2 = st.columns([2, 1])
-            nova_senha_adm = rs1.text_input(f"Nova senha para o Usuário ID {u_alvo}:", type="password", key="adm_pw_reset")
-            if rs2.button("🔑 Atualizar Senha Criptografada"):
-                if len(nova_senha_adm) >= 4:
-                    executar_query("UPDATE usuarios SET senha_hash = ? WHERE id = ?", (gerar_hash_senha(nova_senha_adm), int(u_alvo)))
-                    st.success(f"✅ Senha do usuário ID {u_alvo} atualizada com criptografia PBKDF2-SHA256!")
                 else:
-                    st.warning("Digite pelo menos 4 caracteres.")
+                    st.info("Selecione outro ID de usuário para puxar os dados.")
+
+            st.markdown("---")
+            col_senha_adm, col_del_adm = st.columns(2)
+            
+            with col_senha_adm:
+                st.markdown("##### 🔐 Redefinir Senha do Usuário")
+                nova_senha_adm = st.text_input(f"Nova senha para o ID {u_alvo}:", type="password", key="adm_pw_reset")
+                if st.button("🔑 Atualizar Senha Criptografada", use_container_width=True):
+                    if len(nova_senha_adm) >= 4:
+                        executar_query("UPDATE usuarios SET senha_hash = ? WHERE id = ?", (gerar_hash_senha(nova_senha_adm), int(u_alvo)))
+                        st.success(f"✅ Senha do usuário ID {u_alvo} atualizada!")
+                    else:
+                        st.warning("Digite pelo menos 4 caracteres.")
+
+            with col_del_adm:
+                st.markdown("##### 🗑️ Excluir Conta de Usuário")
+                if int(u_alvo) == 1 or int(u_alvo) == USER_ID:
+                    st.info("🛡️ A sua conta principal de Administrador (ID 1) é protegida e não pode ser excluída.")
+                else:
+                    confirmar_del = st.checkbox(f"Confirmo que desejo excluir definitivamente o usuário ID {u_alvo}", key="chk_del_u")
+                    if st.button(f"🚨 Excluir Usuário ID {u_alvo} Agora", use_container_width=True):
+                        if confirmar_del:
+                            uid_del = int(u_alvo)
+                            executar_query("DELETE FROM transacoes WHERE usuario_id = ?", (uid_del,))
+                            executar_query("DELETE FROM compras_futuras WHERE usuario_id = ?", (uid_del,))
+                            executar_query("DELETE FROM investimentos WHERE usuario_id = ?", (uid_del,))
+                            executar_query("DELETE FROM poupanca_metas WHERE usuario_id = ?", (uid_del,))
+                            executar_query("DELETE FROM cotas_ia WHERE usuario_id = ?", (uid_del,))
+                            executar_query("DELETE FROM usuarios WHERE id = ?", (uid_del,))
+                            st.success(f"✅ Usuário ID {uid_del} removido do sistema com sucesso!")
+                            st.rerun()
+                        else:
+                            st.warning("⚠️ Marque a caixa de confirmação acima antes de excluir.")
 
     df_tudo_user = get_df("SELECT * FROM transacoes WHERE usuario_id = ? ORDER BY data_competencia DESC", (USER_ID,))
     
@@ -1434,18 +1459,46 @@ with tabs[7]:
                     os.remove(caminho_tmp)
 
     st.markdown("---")
-    st.subheader("📋 3. Base de Lançamentos da Sua Conta")
+    st.subheader("📋 3. Editor Rápido em Planilha (Clique 2x na célula para editar)")
     if not df_tudo_user.empty:
-        df_tudo_user['valor_formatado'] = df_tudo_user['valor'].apply(m_fmt)
-        cols_ex = [c for c in ['id', 'tipo', 'descricao', 'categoria', 'valor_formatado', 'data_competencia', 'status', 'cartao_vinculado'] if c in df_tudo_user.columns]
-        st.dataframe(df_tudo_user[cols_ex], use_container_width=True)
+        cols_edit = ['id', 'tipo', 'descricao', 'categoria', 'valor', 'data_competencia', 'status', 'cartao_vinculado']
+        cols_presentes = [c for c in cols_edit if c in df_tudo_user.columns]
         
-        ca1, ca2, ca3, ca4 = st.columns(4)
-        id_sel = ca1.selectbox("ID do Registro:", df_tudo_user['id'].tolist())
-        novo_st = ca2.selectbox("Novo Status:", ["Pago", "Pendente"])
-        if ca3.button("💾 Alterar Status"):
-            executar_query("UPDATE transacoes SET status = ? WHERE id = ? AND usuario_id = ?", (novo_st, int(id_sel), USER_ID))
-            st.rerun()
-        if ca4.button("🗑️ Excluir ID"):
-            executar_query("DELETE FROM transacoes WHERE id = ? AND usuario_id = ?", (int(id_sel), USER_ID))
+        df_editado = st.data_editor(
+            df_tudo_user[cols_presentes],
+            use_container_width=True,
+            hide_index=True,
+            disabled=["id"],
+            column_config={
+                "id": st.column_config.NumberColumn("ID", width="small"),
+                "tipo": st.column_config.SelectboxColumn("Tipo", options=["Despesa", "Receita"], width="small"),
+                "descricao": st.column_config.TextColumn("Descrição", width="medium"),
+                "categoria": st.column_config.TextColumn("Categoria", width="small"),
+                "valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", min_value=0.0),
+                "status": st.column_config.SelectboxColumn("Status", options=["Pago", "Pendente"], width="small"),
+                "cartao_vinculado": st.column_config.SelectboxColumn("Cartão", options=[""] + cartoes_banco, width="small")
+            },
+            key="editor_transacoes"
+        )
+        
+        ce1, ce2, ce3 = st.columns([1.5, 1.5, 2])
+        if ce1.button("💾 Salvar Edições da Tabela", type="primary", use_container_width=True):
+            conn_e = get_connection()
+            cur_e = conn_e.cursor()
+            try:
+                for _, r_ed in df_editado.iterrows():
+                    cur_e.execute(
+                        "UPDATE transacoes SET tipo=%s, descricao=%s, categoria=%s, valor=%s, status=%s, cartao_vinculado=%s WHERE id=%s AND usuario_id=%s",
+                        (r_ed['tipo'], str(r_ed['descricao']).strip(), str(r_ed['categoria']).strip(), float(r_ed['valor']), r_ed['status'], r_ed['cartao_vinculado'] or None, int(r_ed['id']), USER_ID)
+                    )
+                conn_e.commit()
+                st.cache_data.clear()
+                st.success("✅ Alterações salvas com sucesso!")
+                st.rerun()
+            finally:
+                conn_e.close()
+
+        id_del_unit = ce2.selectbox("Excluir ID específico:", df_tudo_user['id'].tolist(), label_visibility="collapsed")
+        if ce3.button(f"🗑️ Excluir Registro ID {id_del_unit}", use_container_width=True):
+            executar_query("DELETE FROM transacoes WHERE id = ? AND usuario_id = ?", (int(id_del_unit), USER_ID))
             st.rerun()
