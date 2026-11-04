@@ -1,3 +1,12 @@
+"""
+=============================================================================
+PROJETO: Core Finance PRO | Enterprise Commercial Edition
+DESCRIÇÃO: Plataforma Cloud Multi-Usuário de Gestão Financeira, Poupança,
+           Investimentos, Cotações Diárias (Selic/CDI/B3) e Google Gemini IA.
+ARQUITETURA: Isolamento por Usuário + Hierarquia Admin (Dono) / PRO / FREE.
+=============================================================================
+"""
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -6,7 +15,6 @@ import numpy as np
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import yfinance as yf
-import feedparser
 import psycopg2
 from psycopg2.extras import execute_batch
 import sqlite3
@@ -24,7 +32,12 @@ warnings.filterwarnings('ignore', category=UserWarning, module='pandas')
 # =====================================================================
 # 1. CONFIGURAÇÃO DA PÁGINA E DESIGN SYSTEM (GLASSMORPHISM)
 # =====================================================================
-st.set_page_config(page_title="Core Finance PRO | Multi-User Cloud", layout="wide", page_icon="⚡")
+st.set_page_config(
+    page_title="Core Finance PRO | Multi-User Cloud",
+    layout="wide",
+    page_icon="⚡",
+    initial_sidebar_state="expanded"
+)
 
 if 'perfil_ativo' not in st.session_state:
     st.session_state.perfil_ativo = 'Pessoal'
@@ -55,6 +68,16 @@ st.markdown(f"""
         border-radius: 14px;
         margin-bottom: 12px;
     }}
+    .admin-badge {{
+        background: linear-gradient(90deg, #f59e0b, #d97706);
+        color: #0f172a;
+        padding: 6px 12px;
+        border-radius: 8px;
+        font-weight: 800;
+        font-size: 0.85rem;
+        display: inline-block;
+        margin-bottom: 8px;
+    }}
     .alert-card-red {{ background: rgba(233, 69, 96, 0.15); border-left: 5px solid #e94560; padding: 14px; border-radius: 10px; margin-bottom: 8px; }}
     .alert-card-yellow {{ background: rgba(255, 152, 0, 0.15); border-left: 5px solid #ff9800; padding: 14px; border-radius: 10px; margin-bottom: 8px; }}
     .alert-card-green {{ background: rgba(76, 175, 80, 0.15); border-left: 5px solid #4caf50; padding: 14px; border-radius: 10px; margin-bottom: 8px; }}
@@ -71,17 +94,18 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 def m_fmt(valor):
-    if pd.isna(valor) or valor is None: return "R$ 0,00"
+    """Formata valores numéricos para o padrão monetário brasileiro (R$ 1.234,56)"""
+    if pd.isna(valor) or valor is None:
+        return "R$ 0,00"
     return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 cartoes_banco = ["NUBANK", "PICPAY", "INTER", "MERCADO PAGO", "WILL", "BRADESCO", "RENNER", "OUTRO"]
-meses_pt = {
-    "janeiro": 1, "fevereiro": 2, "março": 3, "abril": 4, "maio": 5, "junho": 6,
-    "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12
-}
+EMAILS_ADMIN_PADRAO = ["evandrosps2013@gmail.com", "pereira.evandro@tjrj.jus.br"]
 
 def detectar_cartao(descricao):
-    if not descricao: return None
+    """Identifica automaticamente o cartão vinculado com base no texto da descrição"""
+    if not descricao:
+        return None
     desc_up = str(descricao).upper()
     if "NUBANK" in desc_up: return "NUBANK"
     if "PICPAY" in desc_up: return "PICPAY"
@@ -93,20 +117,51 @@ def detectar_cartao(descricao):
     return None
 
 # =====================================================================
-# 2. SEGURANÇA, CRIPTOGRAFIA E CAMADA DE DADOS (SUPABASE)
+# 2. SEGURANÇA, CRIPTOGRAFIA HÍBRIDA E CAMADA DE DADOS (SUPABASE)
 # =====================================================================
 def gerar_hash_senha(senha: str) -> str:
+    """Gera hash PBKDF2-SHA256 com salt aleatório de 16 bytes e 100.000 iterações"""
     salt = os.urandom(16).hex()
     dk = hashlib.pbkdf2_hmac('sha256', senha.encode('utf-8'), salt.encode('utf-8'), 100000)
     return f"{salt}${dk.hex()}"
 
-def verificar_senha(senha_digitada: str, hash_salvo: str) -> bool:
+def verificar_senha(senha_digitada: str, hash_salvo: str, senha_legada: str = None) -> tuple:
+    """
+    Verifica a senha digitada.
+    Retorna (autenticado: bool, precisa_atualizar_hash: bool).
+    Aceita tanto o formato criptografado (salt$hash) quanto senhas antigas em texto puro
+    no Supabase (ex.: 'Barcelona12*' ou '1234'), convertendo-as automaticamente no login.
+    """
+    if not senha_digitada:
+        return False, False
+    hash_str = str(hash_salvo or "").strip()
+    if "$" in hash_str:
+        try:
+            salt, hex_hash = hash_str.split('$', 1)
+            dk = hashlib.pbkdf2_hmac('sha256', senha_digitada.encode('utf-8'), salt.encode('utf-8'), 100000)
+            if hmac.compare_digest(dk.hex(), hex_hash):
+                return True, False
+        except Exception:
+            pass
+    # Fallback para senha cadastrada manualmente no banco sem hash
+    if hash_str and senha_digitada == hash_str:
+        return True, True
+    if senha_legada and senha_digitada == str(senha_legada).strip():
+        return True, True
+    return False, False
+
+def obter_chave_gemini_secrets():
+    """Busca a chave da API Gemini tanto na raiz do secrets.toml quanto dentro do bloco [connections.postgresql]"""
     try:
-        salt, hex_hash = hash_salvo.split('$')
-        dk = hashlib.pbkdf2_hmac('sha256', senha_digitada.encode('utf-8'), salt.encode('utf-8'), 100000)
-        return hmac.compare_digest(dk.hex(), hex_hash)
+        k = st.secrets.get("GEMINI_API_KEY", None)
+        if k and len(str(k).strip()) > 10:
+            return str(k).strip()
+        k_nested = st.secrets.get("connections", {}).get("postgresql", {}).get("GEMINI_API_KEY", None)
+        if k_nested and len(str(k_nested).strip()) > 10:
+            return str(k_nested).strip()
     except Exception:
-        return False
+        pass
+    return None
 
 def get_connection():
     return psycopg2.connect(
@@ -125,13 +180,16 @@ def executar_query(query, params=()):
         query = query.replace("?", "%s")
         cursor.execute(query, params)
         conn.commit()
+        st.cache_data.clear()
     except Exception as e:
         conn.rollback()
         raise e
     finally:
         conn.close()
 
+@st.cache_data(ttl=300, show_spinner=False)
 def get_df(query, params=()):
+    """Leitura em cache por 5 minutos para máxima fluidez (limpo automaticamente ao gravar dados)"""
     conn = get_connection()
     try:
         query = query.replace("?", "%s")
@@ -142,46 +200,92 @@ def get_df(query, params=()):
     finally:
         conn.close()
 
+@st.cache_resource(show_spinner=False)
 def init_db():
+    """Inicializa tabelas, índices e migrações apenas 1x por inicialização do servidor"""
     conn = get_connection()
     cursor = conn.cursor()
     
-    # Criação das tabelas principais e multiusuário
     tabelas = {
-        "usuarios": "id SERIAL PRIMARY KEY, nome TEXT NOT NULL, email TEXT UNIQUE NOT NULL, senha_hash TEXT NOT NULL, renda_mensal REAL DEFAULT 2350.0, criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "usuarios": "id SERIAL PRIMARY KEY, nome TEXT NOT NULL, email TEXT UNIQUE NOT NULL, senha_hash TEXT NOT NULL, renda_mensal REAL DEFAULT 2350.0, plano TEXT DEFAULT 'free', criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         "transacoes": "id SERIAL PRIMARY KEY, usuario_id INTEGER, tipo TEXT, descricao TEXT, categoria TEXT, valor REAL, data_competencia DATE, detalhes TEXT, status TEXT DEFAULT 'Pendente', centro_custo TEXT DEFAULT 'Pessoal', cartao_vinculado TEXT",
         "compras_futuras": "id SERIAL PRIMARY KEY, usuario_id INTEGER, item TEXT, valor REAL, prioridade TEXT, status TEXT DEFAULT 'Planejado', centro_custo TEXT, metodo TEXT DEFAULT 'PIX', parcelas INTEGER DEFAULT 1, cartao_vinculado TEXT",
         "investimentos": "id SERIAL PRIMARY KEY, usuario_id INTEGER, ticker TEXT, tipo_ativo TEXT, quantidade REAL, preco_medio REAL, taxa_fixa_anual REAL DEFAULT 0.0, data_compra DATE, centro_custo TEXT DEFAULT 'Pessoal'",
-        "poupanca_metas": "id SERIAL PRIMARY KEY, usuario_id INTEGER, nome_meta TEXT NOT NULL, categoria TEXT, valor_alvo REAL NOT NULL, valor_atual REAL DEFAULT 0.0, rentabilidade_mensal REAL DEFAULT 0.85, data_limite DATE, centro_custo TEXT DEFAULT 'Pessoal'"
+        "poupanca_metas": "id SERIAL PRIMARY KEY, usuario_id INTEGER, nome_meta TEXT NOT NULL, categoria TEXT, valor_alvo REAL NOT NULL, valor_atual REAL DEFAULT 0.0, rentabilidade_mensal REAL DEFAULT 0.85, data_limite DATE, centro_custo TEXT DEFAULT 'Pessoal'",
+        "cotas_ia": "id SERIAL PRIMARY KEY, usuario_id INTEGER NOT NULL, data_ref DATE NOT NULL DEFAULT CURRENT_DATE, requisicoes INTEGER DEFAULT 0, UNIQUE(usuario_id, data_ref)",
+        "cotacoes_cache": "ticker TEXT PRIMARY KEY, preco REAL DEFAULT 0.0, atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
     }
     for nome, colunas in tabelas.items():
         cursor.execute(f"CREATE TABLE IF NOT EXISTS {nome} ({colunas})")
     
-    # Migração segura: adiciona colunas novas nas tabelas antigas sem apagar nada
     migracoes = [
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS nome TEXT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS email TEXT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS senha_hash TEXT",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS renda_mensal REAL DEFAULT 2350.0",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS plano TEXT DEFAULT 'free'",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user'",
+        "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS senha TEXT DEFAULT '***'",
         "ALTER TABLE transacoes ADD COLUMN IF NOT EXISTS usuario_id INTEGER",
         "ALTER TABLE compras_futuras ADD COLUMN IF NOT EXISTS usuario_id INTEGER",
         "ALTER TABLE investimentos ADD COLUMN IF NOT EXISTS usuario_id INTEGER",
         "ALTER TABLE investimentos ADD COLUMN IF NOT EXISTS taxa_fixa_anual REAL DEFAULT 0.0",
-        "ALTER TABLE investimentos ADD COLUMN IF NOT EXISTS centro_custo TEXT DEFAULT 'Pessoal'"
+        "ALTER TABLE investimentos ADD COLUMN IF NOT EXISTS centro_custo TEXT DEFAULT 'Pessoal'",
+        "UPDATE usuarios SET plano = 'dono', role = 'admin' WHERE id = 1 OR LOWER(email) IN ('evandrosps2013@gmail.com', 'pereira.evandro@tjrj.jus.br')"
     ]
+    conn.commit()
+    conn.autocommit = True
     for m in migracoes:
-        cursor.execute(m)
-        
+        try:
+            cursor.execute(m)
+        except Exception:
+            pass
+    indices = [
+        "CREATE INDEX IF NOT EXISTS idx_trans_usuario ON transacoes(usuario_id, centro_custo)",
+        "CREATE INDEX IF NOT EXISTS idx_trans_data ON transacoes(data_competencia)",
+        "CREATE INDEX IF NOT EXISTS idx_trans_status ON transacoes(status)"
+    ]
+    for idx in indices:
+        try:
+            cursor.execute(idx)
+        except Exception:
+            pass
+    conn.autocommit = False
     conn.commit()
     conn.close()
+    return True
 
-def vincular_dados_orfaos_ao_dono(usuario_id: int):
-    """Se for o usuário nº 1 (Dono do Sistema), adota automaticamente todos os dados antigos sem usuario_id"""
-    if int(usuario_id) == 1:
-        executar_query("UPDATE transacoes SET usuario_id = 1 WHERE usuario_id IS NULL")
-        executar_query("UPDATE compras_futuras SET usuario_id = 1 WHERE usuario_id IS NULL")
-        executar_query("UPDATE investimentos SET usuario_id = 1 WHERE usuario_id IS NULL")
+def consolidar_dados_admin(usuario_id: int, email_usuario: str):
+    """
+    Garante que o Admin (id=1 ou evandrosps2013@gmail.com) receba:
+    1. Todos os registros órfãos (usuario_id IS NULL).
+    2. Todos os registros que foram importados na conta provisória (terstegenelionelmessi@gmail.com),
+       caso a conta Admin ainda esteja sem lançamentos.
+    """
+    eh_admin = (int(usuario_id) == 1) or (str(email_usuario).lower() in EMAILS_ADMIN_PADRAO)
+    if not eh_admin:
+        return
+    executar_query("UPDATE transacoes SET usuario_id = ? WHERE usuario_id IS NULL", (usuario_id,))
+    executar_query("UPDATE compras_futuras SET usuario_id = ? WHERE usuario_id IS NULL", (usuario_id,))
+    executar_query("UPDATE investimentos SET usuario_id = ? WHERE usuario_id IS NULL", (usuario_id,))
+    executar_query("UPDATE poupanca_metas SET usuario_id = ? WHERE usuario_id IS NULL", (usuario_id,))
+
+    # Verifica se os dados ficaram na conta secundária terstegenelionelmessi@gmail.com
+    df_count_admin = get_df("SELECT COUNT(*) AS total FROM transacoes WHERE usuario_id = ?", (usuario_id,))
+    tot_admin = int(df_count_admin.iloc[0]['total']) if not df_count_admin.empty else 0
+    if tot_admin == 0:
+        df_sec = get_df("SELECT id FROM usuarios WHERE LOWER(email) = 'terstegenelionelmessi@gmail.com' AND id != ?", (usuario_id,))
+        if not df_sec.empty:
+            id_sec = int(df_sec.iloc[0]['id'])
+            executar_query("UPDATE transacoes SET usuario_id = ? WHERE usuario_id = ?", (usuario_id, id_sec))
+            executar_query("UPDATE compras_futuras SET usuario_id = ? WHERE usuario_id = ?", (usuario_id, id_sec))
+            executar_query("UPDATE investimentos SET usuario_id = ? WHERE usuario_id = ?", (usuario_id, id_sec))
+            executar_query("UPDATE poupanca_metas SET usuario_id = ? WHERE usuario_id = ?", (usuario_id, id_sec))
 
 init_db()
 
 # =====================================================================
-# 3. TELA DE LOGIN E CADASTRO INDIVIDUAL (MULTI-USUÁRIO)
+# 3. TELA DE LOGIN E CADASTRO INDIVIDUAL (COM RECONHECIMENTO ADMIN)
 # =====================================================================
 if st.session_state.usuario_logado is None:
     col_esq, col_centro, col_dir = st.columns([1, 1.4, 1])
@@ -194,24 +298,44 @@ if st.session_state.usuario_logado is None:
         
         with aba_login:
             with st.form("form_login"):
-                email_in = st.text_input("E-mail Cadastrado", placeholder="seuemail@exemplo.com").strip().lower()
+                email_in = st.text_input("E-mail Cadastrado", placeholder="Ex: evandrosps2013@gmail.com").strip().lower()
                 senha_in = st.text_input("Sua Senha", type="password")
                 if st.form_submit_button("🚀 Acessar Meu Painel", use_container_width=True, type="primary"):
                     if email_in and senha_in:
                         df_u = get_df("SELECT * FROM usuarios WHERE LOWER(email) = ?", (email_in,))
-                        if not df_u.empty and verificar_senha(senha_in, df_u.iloc[0]['senha_hash']):
+                        if not df_u.empty:
                             user_row = df_u.iloc[0]
-                            vincular_dados_orfaos_ao_dono(int(user_row['id']))
-                            st.session_state.usuario_logado = {
-                                "id": int(user_row['id']),
-                                "nome": user_row['nome'],
-                                "email": user_row['email'],
-                                "renda_mensal": float(user_row['renda_mensal'] or 2350.0)
-                            }
-                            st.success(f"Bem-vindo(a) de volta, {user_row['nome']}!")
-                            st.rerun()
+                            senha_legada_db = user_row['senha'] if 'senha' in df_u.columns else None
+                            autenticado, converter_hash = verificar_senha(senha_in, user_row.get('senha_hash'), senha_legada_db)
+                            if autenticado:
+                                uid = int(user_row['id'])
+                                # Se a senha estava em texto puro no banco, criptografa automaticamente agora
+                                if converter_hash:
+                                    executar_query("UPDATE usuarios SET senha_hash = ? WHERE id = ?", (gerar_hash_senha(senha_in), uid))
+                                
+                                # Verifica se é a conta Admin principal
+                                role_db = str(user_row.get('role') or '').lower() if 'role' in df_u.columns else ''
+                                plano_db = str(user_row.get('plano') or '').lower() if 'plano' in df_u.columns else ''
+                                eh_dono = (uid == 1) or (role_db == 'admin') or (plano_db == 'dono') or (email_in in EMAILS_ADMIN_PADRAO)
+                                plano_final = 'dono' if eh_dono else (plano_db if plano_db in ['pro', 'free'] else 'free')
+                                
+                                if eh_dono and plano_db != 'dono':
+                                    executar_query("UPDATE usuarios SET plano = 'dono', role = 'admin' WHERE id = ?", (uid,))
+                                
+                                consolidar_dados_admin(uid, email_in)
+                                st.session_state.usuario_logado = {
+                                    "id": uid,
+                                    "nome": user_row['nome'],
+                                    "email": user_row['email'],
+                                    "renda_mensal": float(user_row['renda_mensal'] or 2350.0),
+                                    "plano": plano_final
+                                }
+                                st.success(f"Bem-vindo(a), {user_row['nome']}!")
+                                st.rerun()
+                            else:
+                                st.error("❌ E-mail ou senha incorretos.")
                         else:
-                            st.error("❌ E-mail ou senha incorretos.")
+                            st.error("❌ E-mail não encontrado. Verifique a digitação ou crie uma conta.")
                     else:
                         st.warning("Preencha seu e-mail e senha.")
 
@@ -238,31 +362,45 @@ if st.session_state.usuario_logado is None:
                             st.error("❌ Este e-mail já possui uma conta cadastrada. Use a aba 'Entrar'.")
                         else:
                             hash_pw = gerar_hash_senha(senha_cad)
+                            eh_email_admin = email_cad in EMAILS_ADMIN_PADRAO
+                            plano_ini = 'dono' if eh_email_admin else 'free'
+                            role_ini = 'admin' if eh_email_admin else 'user'
                             executar_query(
-                                "INSERT INTO usuarios (nome, email, senha_hash, renda_mensal) VALUES (?,?,?,?)",
-                                (nome_cad, email_cad, hash_pw, renda_cad)
+                                "INSERT INTO usuarios (nome, email, senha_hash, renda_mensal, plano, role, senha) VALUES (?,?,?,?,?,?,?)",
+                                (nome_cad, email_cad, hash_pw, renda_cad, plano_ini, role_ini, '***')
                             )
                             df_novo = get_df("SELECT * FROM usuarios WHERE LOWER(email) = ?", (email_cad,))
                             novo_id = int(df_novo.iloc[0]['id'])
-                            vincular_dados_orfaos_ao_dono(novo_id)
+                            if novo_id == 1:
+                                plano_ini = 'dono'
+                                executar_query("UPDATE usuarios SET plano = 'dono', role = 'admin' WHERE id = 1")
+                            consolidar_dados_admin(novo_id, email_cad)
                             st.session_state.usuario_logado = {
                                 "id": novo_id,
                                 "nome": nome_cad,
                                 "email": email_cad,
-                                "renda_mensal": float(renda_cad)
+                                "renda_mensal": float(renda_cad),
+                                "plano": plano_ini
                             }
                             st.success("✅ Conta criada com sucesso! Entrando no sistema...")
                             st.rerun()
     st.stop()
 
 # =====================================================================
-# 4. MOTORES DE CÁLCULO, IMPORTAÇÃO E INTELIGÊNCIA ARTIFICIAL (GEMINI)
+# 4. MOTORES DE MERCADO, COTAÇÕES DIÁRIAS E INTELIGÊNCIA ARTIFICIAL
 # =====================================================================
 USER_ID = int(st.session_state.usuario_logado["id"])
 USER_NOME = st.session_state.usuario_logado["nome"]
+USER_EMAIL = str(st.session_state.usuario_logado["email"]).lower()
+USER_PLANO = st.session_state.usuario_logado.get("plano", "free")
+IS_ADMIN = (USER_ID == 1) or (USER_PLANO == "dono") or (USER_EMAIL in EMAILS_ADMIN_PADRAO)
+
+hoje = datetime.now()
+hoje_data = hoje.date()
 
 def calcular_score_financeiro(renda, despesas, total_guardado):
-    if renda <= 0: return 300
+    if renda <= 0:
+        return 300
     taxa_poupanca = (renda - despesas) / renda
     bonus_reserva = min(150, (total_guardado / max(renda, 1)) * 50)
     if taxa_poupanca >= 0.20: base = 800 + (taxa_poupanca * 100)
@@ -271,75 +409,184 @@ def calcular_score_financeiro(renda, despesas, total_guardado):
     else: base = max(100, 400 - (abs(taxa_poupanca) * 800))
     return min(1000, base + bonus_reserva)
 
-@st.cache_data(ttl=1800)
+def sincronizar_mercado_diario(forcar=False):
+    """
+    Atualiza Selic, CDI (via BrasilAPI) e principais cotações (via yfinance)
+    apenas 1x por dia na tabela cotacoes_cache do Supabase, deixando o app instantâneo.
+    """
+    try:
+        df_check = get_df("SELECT atualizado_em FROM cotacoes_cache WHERE ticker = 'SELIC_META'")
+        if not forcar and not df_check.empty:
+            ult_att = pd.to_datetime(df_check.iloc[0]['atualizado_em']).date()
+            if ult_att == hoje_data:
+                return False  # Já está atualizado hoje!
+    except Exception:
+        pass
+
+    conn = get_connection()
+    cur = conn.cursor()
+    agora = datetime.now()
+    # 1. Busca Selic Meta na BrasilAPI
+    try:
+        with urllib.request.urlopen("https://brasilapi.com.br/api/taxas/v1/selic", timeout=8) as r:
+            dados_selic = json.loads(r.read().decode("utf-8"))
+            val_raw = float(dados_selic.get("valor", 11.25))
+            selic = val_raw * 100 if val_raw < 1.0 else val_raw
+            for tk, v in [("SELIC_META", selic), ("CDI_ESTIMADO", max(0.0, selic - 0.10))]:
+                cur.execute(
+                    "INSERT INTO cotacoes_cache (ticker, preco, atualizado_em) VALUES (%s,%s,%s) "
+                    "ON CONFLICT (ticker) DO UPDATE SET preco=EXCLUDED.preco, atualizado_em=EXCLUDED.atualizado_em",
+                    (tk, v, agora)
+                )
+    except Exception:
+        pass
+
+    # 2. Busca Câmbio, Índices e Bitcoin
+    for tk in ["USDBRL=X", "EURBRL=X", "BTC-USD", "^BVSP"]:
+        try:
+            hist = yf.Ticker(tk).history(period="1d")
+            if not hist.empty:
+                preco = float(hist["Close"].iloc[-1])
+                cur.execute(
+                    "INSERT INTO cotacoes_cache (ticker, preco, atualizado_em) VALUES (%s,%s,%s) "
+                    "ON CONFLICT (ticker) DO UPDATE SET preco=EXCLUDED.preco, atualizado_em=EXCLUDED.atualizado_em",
+                    (tk, preco, agora)
+                )
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
+    st.cache_data.clear()
+    return True
+
+@st.cache_data(ttl=43200, show_spinner=False)
 def obter_cotacao_atual(ticker):
+    """Lê instantaneamente do cache diário no Supabase ou busca no yfinance se for um ativo novo"""
     try:
         t = ticker.strip().upper()
         if not t.endswith('.SA') and not t.endswith('=X') and not t.endswith('-USD') and not t.startswith('^'):
             t += '.SA'
+        df_cache = get_df("SELECT preco FROM cotacoes_cache WHERE ticker = ?", (t,))
+        if not df_cache.empty and float(df_cache.iloc[0]['preco']) > 0:
+            return float(df_cache.iloc[0]['preco'])
         hist = yf.Ticker(t).history(period="1d")
         if not hist.empty:
-            return float(hist['Close'].iloc[-1])
+            preco = float(hist['Close'].iloc[-1])
+            try:
+                c = get_connection(); cur = c.cursor()
+                cur.execute(
+                    "INSERT INTO cotacoes_cache (ticker, preco, atualizado_em) VALUES (%s,%s,CURRENT_TIMESTAMP) "
+                    "ON CONFLICT (ticker) DO UPDATE SET preco = EXCLUDED.preco, atualizado_em = CURRENT_TIMESTAMP",
+                    (t, preco)
+                )
+                c.commit(); c.close()
+            except Exception:
+                pass
+            return preco
         return 0.0
     except Exception:
         return 0.0
 
 def calcular_price(valor_financiado, taxa_mensal, prazo_meses):
     i = taxa_mensal / 100
-    if i == 0: return valor_financiado / prazo_meses
+    if i == 0:
+        return valor_financiado / prazo_meses
     return valor_financiado * (i * (1 + i)**prazo_meses) / ((1 + i)**prazo_meses - 1)
 
-def consultar_gemini_ia(prompt_usuario, contexto_financeiro, api_key_custom=None):
-    """Chama a API Oficial do Google Gemini 2.5 Flash via HTTPS nativo (sem risco de quebrar pacotes)"""
+# Limites diários de IA por categoria de conta
+LIMITES_IA = {"dono": 99999, "pro": 50, "free": 5}
+
+def obter_consumo_ia_hoje():
+    df_q = get_df("SELECT requisicoes FROM cotas_ia WHERE usuario_id = ? AND data_ref = ?", (USER_ID, hoje_data.isoformat()))
+    return int(df_q.iloc[0]['requisicoes']) if not df_q.empty else 0
+
+def registrar_consumo_ia():
+    executar_query(
+        "INSERT INTO cotas_ia (usuario_id, data_ref, requisicoes) VALUES (?,?,1) "
+        "ON CONFLICT (usuario_id, data_ref) DO UPDATE SET requisicoes = cotas_ia.requisicoes + 1",
+        (USER_ID, hoje_data.isoformat())
+    )
+
+def consultar_gemini_ia(prompt_usuario, contexto_financeiro, api_key_custom=None, modelo_admin_preferido="gemini-2.5-pro"):
+    """
+    Motor de Inteligência Artificial com separação de privilégios:
+    - Conta ADMIN (Dono): Sem limite de consultas, até 2048 tokens de resposta, opção de usar Gemini 2.5 Pro (com fallback automático para 2.5 Flash).
+    - Conta PRO: 50 consultas/dia com Gemini 2.5 Flash (1500 tokens).
+    - Conta FREE: 5 consultas/dia com Gemini 2.5 Flash-Lite (750 tokens) para economizar cota da API.
+    """
     chave_api = api_key_custom
-    if not chave_api:
-        try:
-            chave_api = st.secrets.get("GEMINI_API_KEY", None)
-        except Exception:
-            chave_api = None
+    usa_chave_propria = bool(chave_api and len(str(chave_api).strip()) > 10)
+    if not usa_chave_propria:
+        chave_api = obter_chave_gemini_secrets()
 
     if chave_api and len(str(chave_api).strip()) > 10:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={str(chave_api).strip()}"
+        limite = LIMITES_IA.get("dono" if IS_ADMIN else USER_PLANO, 5)
+
+        if not usa_chave_propria and not IS_ADMIN and obter_consumo_ia_hoje() >= limite:
+            return (
+                f"⚠️ **Limite diário de IA atingido** (Plano {USER_PLANO.upper()}: {limite} análises/dia). "
+                "Solicite o upgrade para o plano PRO ao administrador ou insira sua chave gratuita do Google AI Studio ao lado.\n\n"
+                + gerar_diagnostico_nativo(contexto_financeiro)
+            )
+
+        if IS_ADMIN:
+            modelos_tentativa = [modelo_admin_preferido, "gemini-2.5-flash"] if modelo_admin_preferido != "gemini-2.5-flash" else ["gemini-2.5-flash"]
+            max_tokens = 2048
+        elif USER_PLANO == "pro":
+            modelos_tentativa = ["gemini-2.5-flash"]
+            max_tokens = 1500
+        else:
+            modelos_tentativa = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+            max_tokens = 750
+
         instrucao_sistema = (
-            f"Você é o Consultor Financeiro Pessoal de Elite do usuário {USER_NOME} dentro do sistema Core Finance PRO. "
-            "Analise os números reais do usuário abaixo com precisão matemática, empatia e foco prático. "
-            "Use formatação em tópicos claros, cite os nomes reais das despesas/cartões dele quando relevante e dê recomendações acionáveis.\n\n"
+            f"Você é o Consultor Financeiro Pessoal e Estrategista Patrimonial de {USER_NOME} no sistema Core Finance PRO. "
+            "Analise os números reais do usuário abaixo com precisão matemática, clareza executiva e foco prático. "
+            "Use tópicos organizados, cite os nomes reais das despesas/cartões/metas quando relevante e proponha metas numéricas claras.\n\n"
             f"DADOS REAIS DO USUÁRIO NESTE MOMENTO:\n{contexto_financeiro}\n\n"
-            f"PERGUNTA/PEDIDO DO USUÁRIO: {prompt_usuario}"
+            f"SOLICITAÇÃO DO USUÁRIO: {prompt_usuario}"
         )
         payload = {
             "contents": [{"parts": [{"text": instrucao_sistema}]}],
-            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1200}
+            "generationConfig": {"temperature": 0.35, "maxOutputTokens": max_tokens}
         }
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode('utf-8'),
-                headers={'Content-Type': 'application/json'},
-                method='POST'
-            )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                dados_resp = json.loads(resp.read().decode('utf-8'))
-                return dados_resp['candidates'][0]['content']['parts'][0]['text']
-        except Exception as e:
-            return f"⚠️ **Nota da API Gemini:** Não foi possível conectar à chave informada ({e}). Exibindo diagnóstico do Motor Analítico Interno:\n\n" + gerar_diagnostico_nativo(contexto_financeiro)
+
+        ultimo_erro = None
+        for mod in modelos_tentativa:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent?key={str(chave_api).strip()}"
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST'
+                )
+                with urllib.request.urlopen(req, timeout=25) as resp:
+                    dados_resp = json.loads(resp.read().decode('utf-8'))
+                    if not usa_chave_propria:
+                        registrar_consumo_ia()
+                    texto_ia = dados_resp['candidates'][0]['content']['parts'][0]['text']
+                    tag_modelo = f"*(Motor utilizado: `{mod}`)*\n\n"
+                    return tag_modelo + texto_ia
+            except Exception as e:
+                ultimo_erro = e
+                continue
+
+        return f"⚠️ **Aviso da API Gemini ({ultimo_erro}):** Exibindo diagnóstico imediato do Motor Analítico Interno:\n\n" + gerar_diagnostico_nativo(contexto_financeiro)
     else:
         return gerar_diagnostico_nativo(contexto_financeiro)
 
 def gerar_diagnostico_nativo(contexto_txt):
-    """Motor analítico nativo instantâneo (funciona gratuitamente mesmo sem API Key)"""
     return (
-        f"### 🧠 Diagnóstico Inteligente Core Finance PRO ({USER_NOME})\n\n"
+        f"### 🧠 Diagnóstico Executivo Core Finance PRO ({USER_NOME})\n\n"
         f"{contexto_txt}\n\n"
-        "**📌 Recomendações Estratégicas Automáticas:**\n"
-        "1. **Blindagem de Fluxo de Caixa:** Priorize a liquidação das faturas de cartão e contas pendentes de maior valor antes de assumir novos parcelamentos.\n"
-        "2. **Aceleração de Poupança:** Direcione pelo menos **10% a 20% das entradas confirmadas** imediatamente para a aba *🐷 Poupança & Cofrinhos* (preferencialmente em CDB 100% CDI ou Reserva Selic).\n"
-        "3. **Gestão de Recebíveis:** Verifique a aba *💰 Recebimentos & Cobranças* e envie os lembretes via WhatsApp para zerar inadimplências no mês.\n\n"
-        "*💡 Dica: Para respostas conversacionais abertas com o Google Gemini 2.5 Flash, insira sua chave gratuita do Google AI Studio no painel ao lado!*"
+        "**📌 Plano de Ação Recomendado:**\n"
+        "1. **Blindagem de Fluxo de Caixa:** Priorize a baixa das despesas pendentes de maior valor e evite novos parcelamentos enquanto o comprometimento mensal estiver acima de 70%.\n"
+        "2. **Aceleração de Reserva (Selic/CDI):** Direcione entre **10% e 20% das entradas** diretamente para a aba *🐷 Poupança & Cofrinhos*.\n"
+        "3. **Recuperação de Recebíveis:** Utilize os links diretos de WhatsApp na aba *💰 Recebimentos & Cobranças* para antecipar valores pendentes."
     )
 
 def importar_arquivo_sqlite_usuario(caminho_sqlite, usuario_id, centro_custo_padrao="Pessoal", preservar_manuais=True):
-    """Importa Despesas.db isolado apenas para a conta do usuário logado"""
     conn_local = sqlite3.connect(caminho_sqlite)
     cur_local = conn_local.cursor()
     cur_local.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -393,6 +640,7 @@ def importar_arquivo_sqlite_usuario(caminho_sqlite, usuario_id, centro_custo_pad
         """
         execute_batch(cur_nuvem, sql_insert, registros_para_inserir, page_size=100)
         conn_nuvem.commit()
+        st.cache_data.clear()
     except Exception as e:
         conn_nuvem.rollback()
         raise e
@@ -400,30 +648,39 @@ def importar_arquivo_sqlite_usuario(caminho_sqlite, usuario_id, centro_custo_pad
         conn_nuvem.close()
     return len(registros_para_inserir)
 
+# Sincroniza o cache diário de mercado silenciosamente 1x por dia
+sincronizar_mercado_diario(forcar=False)
+
 # =====================================================================
 # 5. SIDEBAR CORPORATIVA PERSONALIZADA POR USUÁRIO
 # =====================================================================
-hoje = datetime.now()
-hoje_data = hoje.date()
-
 with st.sidebar:
-    st.markdown(f"### 👤 Olá, {USER_NOME.split()[0]}!")
+    if IS_ADMIN:
+        st.markdown("<div class='admin-badge'>👑 CONTA ADMIN / DONO (IA ∞)</div>", unsafe_allow_html=True)
+    elif USER_PLANO == "pro":
+        st.markdown("<div class='admin-badge' style='background:linear-gradient(90deg,#3b82f6,#1d4ed8);color:white;'>💎 ASSINANTE PRO</div>", unsafe_allow_html=True)
+    else:
+        st.caption("👤 Plano Gratuito (FREE)")
+
+    st.markdown(f"### Olá, {USER_NOME.split()[0]}!")
     st.caption(f"📧 {st.session_state.usuario_logado['email']}")
     if st.button("🚪 Sair da Conta", use_container_width=True):
         st.session_state.usuario_logado = None
         st.rerun()
         
     st.markdown("---")
-    nova_renda = st.number_input(
-        "💵 Sua Renda Base Mensal (R$)",
-        value=float(st.session_state.usuario_logado["renda_mensal"]),
-        step=100.0,
-        help="Salário ou renda fixa mensal. Fica salvo automaticamente no seu perfil!"
-    )
-    if nova_renda != st.session_state.usuario_logado["renda_mensal"]:
-        executar_query("UPDATE usuarios SET renda_mensal = ? WHERE id = ?", (nova_renda, USER_ID))
-        st.session_state.usuario_logado["renda_mensal"] = nova_renda
-        st.rerun()
+    with st.form("form_renda_sidebar"):
+        nova_renda = st.number_input(
+            "💵 Sua Renda Base Mensal (R$)",
+            value=float(st.session_state.usuario_logado["renda_mensal"]),
+            step=100.0,
+            help="Salário ou renda fixa mensal. Fica salvo no seu perfil ao clicar em Salvar."
+        )
+        if st.form_submit_button("💾 Salvar Renda", use_container_width=True):
+            executar_query("UPDATE usuarios SET renda_mensal = ? WHERE id = ?", (nova_renda, USER_ID))
+            st.session_state.usuario_logado["renda_mensal"] = nova_renda
+            st.success("✅ Renda atualizada!")
+            st.rerun()
     renda_real_declarada = st.session_state.usuario_logado["renda_mensal"]
     
     st.session_state.perfil_ativo = st.selectbox("🏢 Contexto / Workspace:", ["Pessoal", "Elite Beach Performance / Negócios"])
@@ -499,14 +756,13 @@ tabs = st.tabs([
     "📈 Investimentos",
     "🤖 Consultor Gemini IA",
     "🔮 Simuladores & Mercado",
-    "⚙️ Conta & Backup"
+    "⚙️ Conta, Backup & Admin" if IS_ADMIN else "⚙️ Conta & Backup"
 ])
 
 # =====================================================================
 # TAB 1 (tabs[0]): DASHBOARD 360°
 # =====================================================================
 with tabs[0]:
-    # 1. FILTRO DE PERÍODO EXECUTIVO (PERMITE NAVEGAR POR QUALQUER MÊS/ANO)
     col_f1, col_f2, col_f3 = st.columns([1.5, 1.5, 3])
     nomes_meses = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"]
     mes_sel_nome = col_f1.selectbox("📅 Mês de Referência:", nomes_meses, index=hoje.month - 1)
@@ -515,10 +771,8 @@ with tabs[0]:
     anos_disp = sorted(list(set([hoje.year - 1, hoje.year, hoje.year + 1] + (df_trans['data_competencia_dt'].dt.year.dropna().astype(int).tolist() if not df_trans.empty else []))))
     ano_sel_num = col_f2.selectbox("📆 Ano:", anos_disp, index=anos_disp.index(hoje.year) if hoje.year in anos_disp else 0)
 
-    # Recalcula os indicadores para o Mês/Ano selecionado no Dashboard
     if not df_trans.empty:
         df_dash = df_trans[(df_trans['data_competencia_dt'].dt.month == mes_sel_num) & (df_trans['data_competencia_dt'].dt.year == ano_sel_num)].copy()
-        # Mês anterior para comparação percentual (MoM)
         dt_ant = datetime(ano_sel_num, mes_sel_num, 1) - relativedelta(months=1)
         df_ant = df_trans[(df_trans['data_competencia_dt'].dt.month == dt_ant.month) & (df_trans['data_competencia_dt'].dt.year == dt_ant.year)]
         desp_mes_anterior = df_ant[df_ant['tipo'] == 'Despesa']['valor'].sum() if not df_ant.empty else 0.0
@@ -540,11 +794,10 @@ with tabs[0]:
 
     with col_f3:
         cor_comp = "#4caf50" if comprometimento_renda <= 70 else "#ff9800" if comprometimento_renda <= 90 else "#e94560"
-        st.markdown(f"** Termômetro de {mes_sel_nome}/{ano_sel_num}:** Renda comprometida em <span style='color:{cor_comp};font-weight:bold;'>{comprometimento_renda:.1f}%</span>", unsafe_allow_html=True)
+        st.markdown(f"**🌡️ Termômetro de {mes_sel_nome}/{ano_sel_num}:** Renda comprometida em <span style='color:{cor_comp};font-weight:bold;'>{comprometimento_renda:.1f}%</span>", unsafe_allow_html=True)
         st.progress(min(comprometimento_renda / 100.0, 1.0))
         st.caption(f"✅ Quitadas: {m_fmt(desp_pagas_d)} | ⏳ Faltam pagar: {m_fmt(desp_pend_d)} | 📈 Variação vs mês anterior: {var_mom:+.1f}%")
 
-    # 2. CARDS EXECUTIVOS (5 KPIS)
     k1, k2, k3, k4, k5 = st.columns(5)
     score = calcular_score_financeiro(entradas_d + rec_pend_d, desp_tot_d, patrimonio_acumulado)
     
@@ -555,7 +808,6 @@ with tabs[0]:
     k4.markdown(f"<div class='metric-card'>Patrimônio & Reserva<br><h3 style='color:#a855f7;margin:4px 0;'>{m_fmt(patrimonio_acumulado)}</h3><small>Cofrinhos: <b>{m_fmt(total_poupanca_guardado)}</b></small></div>", unsafe_allow_html=True)
     k5.markdown(f"<div class='metric-card'>Score Financeiro<br><h3 style='color:#ff9800;margin:4px 0;'>{score:.0f} / 1000</h3><small>Nível: {'Excelente' if score >= 750 else 'Estável' if score >= 550 else 'Atenção'}</small></div>", unsafe_allow_html=True)
 
-    # 3. RADAR DE VENCIMENTOS DA SEMANA + TOP 5 VILÕES DO ORÇAMENTO
     st.markdown("---")
     r_col1, r_col2 = st.columns([1.2, 1])
     with r_col1:
@@ -592,7 +844,6 @@ with tabs[0]:
         else:
             st.info("Nenhuma despesa neste mês.")
 
-    # 4. GRÁFICOS INTERATIVOS (WATERFALL + ROSCA)
     st.markdown("---")
     cg1, cg2 = st.columns([1.7, 1.3])
     with cg1:
@@ -628,7 +879,6 @@ with tabs[0]:
             fig_pie.update_layout(height=360, margin=dict(l=0, r=0, t=20, b=0))
             st.plotly_chart(fig_pie, use_container_width=True)
 
-    # 5. EVOLUÇÃO ANUAL (COMPARATIVO MÊS A MÊS NO ANO SELECIONADO)
     if not df_trans.empty:
         st.markdown("---")
         st.subheader(f"📅 Evolução Mensal de Saídas em {ano_sel_num}")
@@ -673,7 +923,7 @@ with tabs[1]:
                 "Caderneta de Poupança (~0,60% a.m.)",
                 "Espécie / Conta Corrente (0% a.m.)"
             ])
-             rent_padrao = 0.60 if "Poupança" in cat_cofre else 0.0 if "Espécie" in cat_cofre else 0.90
+            rent_padrao = 0.60 if "Poupança" in cat_cofre else 0.0 if "Espécie" in cat_cofre else 0.90
             
             fc4, fc5, fc6, fc7 = st.columns(4)
             alvo_cofre = fc4.number_input("Meta de Valor (R$)", min_value=10.0, value=5000.0, step=100.0)
@@ -798,10 +1048,10 @@ with tabs[2]:
                     st.rerun()
 
 # =====================================================================
-# TAB 4 (tabs[3]): DESPESAS, BAIXA MENSAL E AUDITORIA DE CARTÕES
+# TAB 4 (tabs[3]): DESPESAS, BAIXA MENSAL, CARTÕES E WISHLIST INTELIGENTE
 # =====================================================================
 with tabs[3]:
-    op_menu = st.radio("Painel Operacional:", ["➕ Lançar Despesa", "✅ Dar Baixa nas Contas do Mês", "💳 Auditoria de Cartões", "🛒 Wishlist Planejada"], horizontal=True)
+    op_menu = st.radio("Painel Operacional:", ["➕ Lançar Despesa", "✅ Dar Baixa nas Contas do Mês", "💳 Auditoria de Cartões", "🛒 Simulador 'Posso Comprar?' & Wishlist"], horizontal=True)
     
     if op_menu == "➕ Lançar Despesa":
         with st.form("form_lanc", clear_on_submit=True):
@@ -867,20 +1117,48 @@ with tabs[3]:
         else:
             st.info("Nenhuma fatura mapeada.")
 
-    elif op_menu == "🛒 Wishlist Planejada":
-        c_w1, c_w2, c_w3 = st.columns(3)
-        w_item = c_w1.text_input("Item Desejado")
-        w_valor = c_w2.number_input("Valor Estimado (R$)", min_value=0.0)
-        w_prio = c_w3.selectbox("Prioridade", ["Alta", "Média", "Baixa"])
-        if st.button("➕ Adicionar à Wishlist"):
+    elif op_menu == "🛒 Simulador 'Posso Comprar?' & Wishlist":
+        st.subheader("🔮 Simulador de Impacto antes da Compra")
+        c_w1, c_w2, c_w3, c_w4 = st.columns(4)
+        w_item = c_w1.text_input("Item Desejado (Ex: Monitor, Viagem)")
+        w_valor = c_w2.number_input("Valor Total (R$)", min_value=0.0, step=50.0)
+        w_parc = c_w3.number_input("Simular em quantas parcelas?", min_value=1, max_value=24, value=1)
+        w_prio = c_w4.selectbox("Prioridade", ["Alta", "Média", "Baixa"])
+        
+        if w_valor > 0:
+            val_p_sim = w_valor / w_parc
+            sobra_base = max(saldo_projetado_mes, renda_real_declarada * 0.25)
+            impacto_pct = (val_p_sim / max(renda_real_declarada, 1)) * 100
+            if saldo_projetado_mes >= val_p_sim and impacto_pct <= 15:
+                st.success(f"🟢 **Compra Segura!** A parcela de **{m_fmt(val_p_sim)}** representa apenas **{impacto_pct:.1f}%** da sua renda base e cabe na sua sobra projetada ({m_fmt(saldo_projetado_mes)}).")
+            elif impacto_pct <= 30:
+                st.warning(f"🟡 **Atenção Moderada:** A parcela de **{m_fmt(val_p_sim)}** compromete **{impacto_pct:.1f}%** da sua renda mensal. Avalie aumentar o número de parcelas ou aguardar o próximo mês.")
+            else:
+                st.error(f"🔴 **Alto Risco para o Caixa:** A parcela de **{m_fmt(val_p_sim)}** consome **{impacto_pct:.1f}%** da sua renda mensal. Recomendado guardar o valor primeiro em um Cofrinho!")
+
+        if st.button("➕ Salvar na Wishlist Planejada", type="primary"):
             if w_item and w_valor > 0:
-                executar_query("INSERT INTO compras_futuras (usuario_id, item, valor, prioridade, centro_custo) VALUES (?,?,?,?,?)",
-                               (USER_ID, w_item, w_valor, w_prio, st.session_state.perfil_ativo))
+                executar_query(
+                    "INSERT INTO compras_futuras (usuario_id, item, valor, prioridade, parcelas, centro_custo) VALUES (?,?,?,?,?,?)",
+                    (USER_ID, w_item.strip(), w_valor, w_prio, int(w_parc), st.session_state.perfil_ativo)
+                )
                 st.rerun()
+
         df_wish = get_df("SELECT * FROM compras_futuras WHERE usuario_id = ? AND centro_custo = ?", (USER_ID, st.session_state.perfil_ativo))
         for _, row in df_wish.iterrows():
-            with st.expander(f"🛍️ {row['item']} — {m_fmt(row['valor'])} [{row['status']}]"):
-                if st.button("🗑️ Remover", key=f"del_w_{row['id']}"):
+            n_p = int(row.get('parcelas') or 1)
+            with st.expander(f"🛍️ {row['item']} — {m_fmt(row['valor'])} ({n_p}x de {m_fmt(float(row['valor'])/n_p)}) [{row['prioridade']}]"):
+                cw_a, cw_b = st.columns(2)
+                if cw_a.button("✅ Comprei! Lançar nas Despesas", key=f"buy_w_{row['id']}", type="primary"):
+                    vp = float(row['valor']) / n_p
+                    for i in range(n_p):
+                        executar_query(
+                            "INSERT INTO transacoes (usuario_id, tipo, descricao, categoria, valor, data_competencia, detalhes, status, centro_custo) VALUES (?,?,?,?,?,?,?,?,?)",
+                            (USER_ID, "Despesa", row['item'], "Outros", vp, hoje_data + relativedelta(months=i), f"Wishlist {i+1}/{n_p}", "Pendente", st.session_state.perfil_ativo)
+                        )
+                    executar_query("DELETE FROM compras_futuras WHERE id = ? AND usuario_id = ?", (int(row['id']), USER_ID))
+                    st.rerun()
+                if cw_b.button("🗑️ Remover da Lista", key=f"del_w_{row['id']}"):
                     executar_query("DELETE FROM compras_futuras WHERE id = ? AND usuario_id = ?", (int(row['id']), USER_ID))
                     st.rerun()
 
@@ -916,10 +1194,10 @@ with tabs[4]:
                 taxa_aa = float(row.get('taxa_fixa_anual') or 11.25) / 100.0
                 fator = (1.0 + taxa_aa) ** (dias_decorridos / 365.0)
                 tot_hoje = tot_pago * fator
-                preco_hoje = float(row['preco_medio']) * fator
             else:
                 preco_hoje = obter_cotacao_atual(row['ticker'])
-                if preco_hoje <= 0: preco_hoje = float(row['preco_medio'])
+                if preco_hoje <= 0:
+                    preco_hoje = float(row['preco_medio'])
                 tot_hoje = float(row['quantidade']) * preco_hoje
             pat_inv += tot_pago
             pat_atual += tot_hoje
@@ -945,12 +1223,11 @@ with tabs[4]:
         st.info("Sua carteira de investimentos está vazia. Cadastre seu primeiro ativo acima!")
 
 # =====================================================================
-# TAB 6 (tabs[5]): CONSULTOR GOOGLE GEMINI IA & PROJEÇÃO FUTURA
+# TAB 6 (tabs[5]): CONSULTOR GOOGLE GEMINI IA (MODO VIP ADMIN VS FREE)
 # =====================================================================
 with tabs[5]:
     st.header("🤖 Consultor Financeiro Google Gemini IA & Contas Futuras")
     
-    # Monta o resumo real dos dados do usuário para alimentar o Gemini
     top_categorias = df_mes[df_mes['tipo'] == 'Despesa'].groupby('categoria')['valor'].sum().to_dict() if not df_mes.empty else {}
     resumo_contexto_ia = (
         f"- Renda Base Mensal: {m_fmt(renda_real_declarada)} | Entradas Confirmadas no Mês: {m_fmt(entradas_confirmadas)}\n"
@@ -962,9 +1239,26 @@ with tabs[5]:
 
     col_ia1, col_ia2 = st.columns([2, 1])
     with col_ia2:
-        st.markdown("#### 🔑 Conexão Google Gemini")
-        st.caption("Você pode pegar uma chave 100% gratuita no site [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey) usando sua conta Google.")
-        api_key_input = st.text_input("Chave API Gemini (Opcional se já estiver nos Secrets):", type="password")
+        st.markdown("#### 🔑 Motor Google Gemini")
+        chave_detectada = obter_chave_gemini_secrets()
+        if chave_detectada:
+            st.success("✅ Chave Gemini Global Ativa nos Secrets")
+        else:
+            st.warning("⚠️ Chave não detectada nos Secrets.")
+        
+        if IS_ADMIN:
+            modelo_escolhido_admin = st.selectbox(
+                "👑 Motor Exclusivo Admin:",
+                ["gemini-2.5-pro", "gemini-2.5-flash"],
+                help="Como Admin/Dono, você pode alternar entre o Gemini 2.5 Pro (máxima inteligência) e o 2.5 Flash (alta velocidade)."
+            )
+        else:
+            modelo_escolhido_admin = "gemini-2.5-flash"
+
+        api_key_input = st.text_input("Chave API Própria (Opcional / BYOK):", type="password")
+        consumo_hoje = obter_consumo_ia_hoje()
+        rotulo_limite = "∞ Ilimitado (Admin)" if IS_ADMIN else f"{LIMITES_IA.get(USER_PLANO, 5)}/dia"
+        st.info(f"👤 Conta: **{'ADMIN / DONO' if IS_ADMIN else USER_PLANO.upper()}**\n\n📊 Uso hoje: **{consumo_hoje} / {rotulo_limite}**")
         
     with col_ia1:
         st.markdown("#### 💬 Pergunte ao Gemini sobre suas Finanças")
@@ -977,13 +1271,13 @@ with tabs[5]:
         if b_ia3.button("📈 Estratégia de Investimentos", use_container_width=True):
             pergunta_rapida = "Com base na minha renda, despesas e saldo em poupança, como devo dividir meus aportes mensais entre Reserva de Emergência e Investimentos?"
             
-        pergunta_custom = st.text_input("Ou digite sua pergunta personalizada para a IA:", placeholder="Ex: Se eu guardar R$ 400 por mês, em quanto tempo atinjo R$ 10.000?")
-        if st.button("✨ Gerar Análise com IA", type="primary"):
+        pergunta_custom = st.text_input("Ou digite sua pergunta personalizada para a IA:", placeholder="Ex: Analise minhas despesas de novembro e monte uma meta para dezembro.")
+        if st.button("✨ Gerar Análise Profunda com IA", type="primary"):
             pergunta_rapida = pergunta_custom or "Faça um diagnóstico completo da minha saúde financeira atual."
 
         if pergunta_rapida:
             with st.spinner("🤖 O Google Gemini está analisando seus indicadores financeiros..."):
-                resposta_ia = consultar_gemini_ia(pergunta_rapida, resumo_contexto_ia, api_key_input)
+                resposta_ia = consultar_gemini_ia(pergunta_rapida, resumo_contexto_ia, api_key_input, modelo_escolhido_admin)
                 st.markdown(f"<div class='ai-response-box'>{resposta_ia}</div>", unsafe_allow_html=True)
 
     st.markdown("---")
@@ -1010,10 +1304,10 @@ with tabs[5]:
         st.table(df_final[['Mês Referência', 'Contas a Pagar', 'A Receber', 'Saldo Projetado (c/ Renda Base)']])
 
 # =====================================================================
-# TAB 7 (tabs[6]): SIMULADORES & MERCADO 3D
+# TAB 7 (tabs[6]): SIMULADORES & MERCADO 3D (COM CACHE DIÁRIO)
 # =====================================================================
 with tabs[6]:
-    sim = st.radio("Ferramenta Estratégica:", ["📐 Orçamento Base-Zero", "🔥 Independência Financeira (F.I.R.E)", "🏦 Simulador Tabela Price", "💎 Curva 3D & Cotações Live"], horizontal=True)
+    sim = st.radio("Ferramenta Estratégica:", ["📐 Orçamento Base-Zero", "🔥 Independência Financeira (F.I.R.E)", "🏦 Simulador Tabela Price", "💎 Curva 3D & Cotações do Dia"], horizontal=True)
     if sim == "📐 Orçamento Base-Zero":
         c_s1, c_s2 = st.columns(2)
         p_essencial = c_s1.slider("🏠 Custos Essenciais e Moradia (%)", 0, 100, 50)
@@ -1042,7 +1336,7 @@ with tabs[6]:
         p = calcular_price(v, t, m)
         st.error(f"Parcela Fixa: **{m_fmt(p)}** | Total Pago: **{m_fmt(p*m)}** | Só de Juros: **{m_fmt((p*m)-v)}**.")
 
-    elif sim == "💎 Curva 3D & Cotações Live":
+    elif sim == "💎 Curva 3D & Cotações do Dia":
         cr1, cr2 = st.columns([2, 1])
         with cr1:
             anos = np.linspace(1, 25, 25)
@@ -1053,14 +1347,63 @@ with tabs[6]:
             fig_3d.update_layout(height=420, scene=dict(xaxis_title='Anos', yaxis_title='Taxa a.a.', zaxis_title='Multiplicador'), template="plotly_dark", margin=dict(l=0, r=0, b=0, t=10))
             st.plotly_chart(fig_3d, use_container_width=True)
         with cr2:
-            for nome, tk in {"Dólar": "USDBRL=X", "Euro": "EURBRL=X", "Bitcoin (USD)": "BTC-USD", "Ibovespa": "^BVSP"}.items():
+            if st.button("🔄 Atualizar Indicadores Agora", use_container_width=True):
+                sincronizar_mercado_diario(forcar=True)
+                st.success("✅ Cotações e Selic atualizadas!")
+                st.rerun()
+            df_selic = get_df("SELECT preco, atualizado_em FROM cotacoes_cache WHERE ticker = 'SELIC_META'")
+            if not df_selic.empty and float(df_selic.iloc[0]['preco']) > 0:
+                selic_v = float(df_selic.iloc[0]['preco'])
+                st.metric("🏦 Selic Meta (a.a.)", f"{selic_v:.2f}%")
+                st.metric("💠 CDI Estimado (a.a.)", f"{max(0.0, selic_v - 0.10):.2f}%")
+                st.caption(f"Cache de {pd.to_datetime(df_selic.iloc[0]['atualizado_em']).strftime('%d/%m/%Y %H:%M')}")
+            for nome, tk in {"Dólar (R$)": "USDBRL=X", "Euro (R$)": "EURBRL=X", "Bitcoin (USD)": "BTC-USD", "Ibovespa": "^BVSP"}.items():
                 st.metric(nome, f"{obter_cotacao_atual(tk):,.2f}")
 
 # =====================================================================
-# TAB 8 (tabs[7]): CONTA, BACKUP E IMPORTAÇÃO ISOLADA
+# TAB 8 (tabs[7]): CONTA, BACKUP E PAINEL EXCLUSIVO DO ADMIN (SAAS)
 # =====================================================================
 with tabs[7]:
-    st.header(f"⚙️ Gestão de Dados & Segurança ({USER_NOME})")
+    st.header(f"⚙️ Gestão de Dados, Backup & Administração ({USER_NOME})")
+    
+    # --- PAINEL EXCLUSIVO DO ADMINISTRADOR (DONO DO SISTEMA) ---
+    if IS_ADMIN:
+        with st.expander("👑 PAINEL MASTER DO ADMINISTRADOR (Gestão de Clientes, Planos e Unificação)", expanded=True):
+            st.caption("Controle exclusivo da sua conta Admin: gerencie planos de usuários (FREE / PRO / DONO), redefina senhas ou unifique dados.")
+            df_todos_users = get_df("SELECT id, nome, email, plano, renda_mensal, criado_em FROM usuarios ORDER BY id")
+            st.dataframe(df_todos_users, use_container_width=True)
+            
+            adm_c1, adm_c2, adm_c3, adm_c4 = st.columns(4)
+            u_alvo = adm_c1.selectbox("Selecionar ID de Usuário:", df_todos_users['id'].tolist())
+            novo_plano_u = adm_c2.selectbox("Alterar Plano para:", ["free", "pro", "dono"])
+            if adm_c3.button("💾 Salvar Plano do Usuário", type="primary"):
+                role_novo = "admin" if novo_plano_u == "dono" else "user"
+                executar_query("UPDATE usuarios SET plano = ?, role = ? WHERE id = ?", (novo_plano_u, role_novo, int(u_alvo)))
+                if int(u_alvo) == USER_ID:
+                    st.session_state.usuario_logado["plano"] = novo_plano_u
+                st.success(f"✅ Usuário ID {u_alvo} atualizado para o plano {novo_plano_u.upper()}!")
+                st.rerun()
+            if adm_c4.button("🔄 Puxar Dados da Conta Secundária p/ Admin"):
+                df_sec_u = get_df("SELECT id FROM usuarios WHERE LOWER(email) = 'terstegenelionelmessi@gmail.com'")
+                if not df_sec_u.empty:
+                    id_s = int(df_sec_u.iloc[0]['id'])
+                    executar_query("UPDATE transacoes SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, id_s))
+                    executar_query("UPDATE compras_futuras SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, id_s))
+                    executar_query("UPDATE investimentos SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, id_s))
+                    executar_query("UPDATE poupanca_metas SET usuario_id = ? WHERE usuario_id = ?", (USER_ID, id_s))
+                    st.success("✅ Todos os registros foram unificados na sua conta Admin!")
+                    st.rerun()
+
+            st.markdown("##### 🔐 Redefinir Senha de Qualquer Usuário (Sem precisar de script externo)")
+            rs1, rs2 = st.columns([2, 1])
+            nova_senha_adm = rs1.text_input(f"Nova senha para o Usuário ID {u_alvo}:", type="password", key="adm_pw_reset")
+            if rs2.button("🔑 Atualizar Senha Criptografada"):
+                if len(nova_senha_adm) >= 4:
+                    executar_query("UPDATE usuarios SET senha_hash = ? WHERE id = ?", (gerar_hash_senha(nova_senha_adm), int(u_alvo)))
+                    st.success(f"✅ Senha do usuário ID {u_alvo} atualizada com criptografia PBKDF2-SHA256!")
+                else:
+                    st.warning("Digite pelo menos 4 caracteres.")
+
     df_tudo_user = get_df("SELECT * FROM transacoes WHERE usuario_id = ? ORDER BY data_competencia DESC", (USER_ID,))
     
     c_adm1, c_adm2 = st.columns(2)
@@ -1085,7 +1428,8 @@ with tabs[7]:
                 st.success(f"✅ {tot_imp} registros sincronizados exclusivamente na sua conta!")
                 st.rerun()
             finally:
-                if os.path.exists(caminho_tmp): os.remove(caminho_tmp)
+                if os.path.exists(caminho_tmp):
+                    os.remove(caminho_tmp)
 
     st.markdown("---")
     st.subheader("📋 3. Base de Lançamentos da Sua Conta")
